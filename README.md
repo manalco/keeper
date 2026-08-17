@@ -1,11 +1,11 @@
 # Keeper
 
 [![status](https://img.shields.io/badge/status-active-108C4A?style=flat-square)](#)
-[![self--check](https://img.shields.io/badge/self--check-66%2F66%20passing-2E7D32?style=flat-square)](#self-check)
+[![self--check](https://img.shields.io/badge/self--check-80%2F80%20passing-2E7D32?style=flat-square)](#self-check)
 [![token cost](https://img.shields.io/badge/token%20cost-~69%20tokens%2Fsession-1565C0?style=flat-square)](#what-it-costs)
 [![probe](https://img.shields.io/badge/probe-0%20API%20calls-1565C0?style=flat-square)](#how-it-works)
 [![threshold](https://img.shields.io/badge/default%20threshold-95%25-D97706?style=flat-square)](#configuration)
-[![platform](https://img.shields.io/badge/platform-macOS%20%C2%B7%20bash-555555?style=flat-square)](#requirements)
+[![platform](https://img.shields.io/badge/platform-macOS%20%C2%B7%20Linux-555555?style=flat-square)](#requirements)
 [![deps](https://img.shields.io/badge/dependencies-python3%20%2B%20claude-555555?style=flat-square)](#requirements)
 [![license](https://img.shields.io/badge/license-CC%20BY--NC--SA%204.0-8E44AD?style=flat-square)](#license)
 [![author](https://img.shields.io/badge/author-Manuel%20Alvarado-1F2937?style=flat-square)](#license)
@@ -22,7 +22,18 @@ intact, instead of having it stop by force.
 [KEEPER:33%]                 normal, green
 [KEEPER:88%]                 approaching the threshold, amber
 [KEEPER:96% BLOCKED 2h14m]   paused, red, counting down
+[KEEPER:33%~]                percentage exact, reset time estimated
+[KEEPER:33%?]                reading older than its refresh interval
+[KEEPER:?]                   no reading yet, grey
+[KEEPER:!]                   no usable reading and a recorded reason, red
+[KEEPER:OFF]                 guarding disabled
 ```
+
+The suffixes are deliberately graded. `~` means the percentage — the number the
+guard actually decides on — is exact and only the reset time is a guess, so the
+guard is working. `!` is reserved for having no usable percentage at all. An
+earlier version raised `!` for both, which fired on every window rollover and
+taught the reader to ignore it.
 
 The badge appends itself to whatever the statusline already renders, so it sits
 alongside any other segments you have configured.
@@ -75,6 +86,13 @@ valid timestamp to release made a zero or corrupt value an unbreakable pause:
 every tool denied indefinitely, including the command that would lift it, so the
 only way out was an external terminal.
 
+In the moments right after a rollover, `/usage` still names the window that just
+ended. A reset label in the past therefore is not an error — the window is five
+hours long, so the next reset is that label plus five hours, and Keeper steps it
+forward rather than flagging it. Reading it as unreadable instead put an alarming
+badge on the statusline at every single rollover and pinned it there for the
+length of the failure backoff.
+
 ## What it costs
 
 | Component | Tokens per session |
@@ -108,7 +126,7 @@ Files:
 |---|---|
 | `~/.claude/skills/keeper/hooks/keeper.sh` | probe, gate, session block, config |
 | `~/.claude/skills/keeper/hooks/keeper-statusline.sh` | `[KEEPER:NN%]` badge |
-| `~/.claude/skills/keeper/hooks/keeper-selfcheck.sh` | 66 offline assertions |
+| `~/.claude/skills/keeper/hooks/keeper-selfcheck.sh` | 80 offline assertions |
 | `~/.claude/skills/keeper/SKILL.md` | the control-surface skill |
 | `~/.claude/.keeper-state` | cached reading (`pct`, `reset_epoch`, `blocked`) |
 | `~/.claude/.keeper-config` | `threshold=95`, `enabled=1` |
@@ -130,7 +148,7 @@ hook matching all tools, and a third segment appended to `statusLine`.
 bash ~/.claude/skills/keeper/hooks/keeper-selfcheck.sh
 ```
 
-66 assertions, fully offline against a fixture in a throwaway `KEEPER_HOME`, so
+80 assertions, fully offline against a fixture in a throwaway `KEEPER_HOME`, so
 it needs no network and never touches real state. Covers percentage parsing,
 timezone-aware reset math, the dateless `resets 3:50pm` variant, inclusive
 threshold, auto-release, percentage zeroing, config validation, refresh cadence,
@@ -210,12 +228,43 @@ Stated plainly, because a guard that oversells itself is worse than none:
 `bash` (3.2 is fine), `python3` for timezone-aware reset math, and the `claude`
 CLI on `PATH`. Nothing to install beyond those.
 
-`timeout` is used when present but never required — it is GNU coreutils and does
-**not** ship with macOS, so depending on it meant the probe died with
-`command not found` on any Mac without Homebrew, wrote nothing, and left the
-guard quietly not guarding. Desktop notifications use `osascript` on macOS,
-fall back to `notify-send`, and are skipped when neither exists; on a system
-with no notifier the pause still works but announces itself only in the badge.
+## Platforms
+
+Runs on macOS and on any Linux distribution. Every command it calls is either
+POSIX or probed for before use, and the two places where the platforms genuinely
+disagree are handled explicitly:
+
+| Concern | How it is handled |
+|---|---|
+| `stat` | GNU `stat -c %Y` is tried first, then BSD `stat -f %m`, and the result is validated as digits before any arithmetic |
+| `timeout` | Used when present, skipped when not — it is GNU coreutils and does **not** ship with macOS |
+| Notifications | `osascript` on macOS, `notify-send` on Linux, silently skipped when neither exists |
+| `setsid` | Never used; it is absent on macOS. Detaching is done with `nohup` |
+| Date arithmetic | `date +%s` only — no `date -v`, no `date -d` |
+| In-place edits | None; writes go through `mktemp` + `mv` |
+| Shell features | Process substitution and `${var//pattern/}` require bash, and all three scripts declare `#!/usr/bin/env bash` |
+
+The `stat` ordering deserves a note, because getting it backwards fails in a way
+that is easy to miss: GNU `stat` reads `-f %m` as a *filename*, prints a
+multi-line filesystem report to stdout, and exits 1. Trying the BSD form first
+therefore ran the fallback too, and the caller received the report and the
+timestamp concatenated — which broke the probe lock, the failure backoff, and
+`status` on every Linux machine while working perfectly on macOS.
+
+Two Linux caveats worth stating plainly:
+
+- **`notify-send` needs a session bus.** On a headless server or in a container
+  there is nothing to notify, so the pause announces itself only through the
+  badge. The guard still works; the announcement does not.
+- **`zoneinfo` needs `tzdata`.** Minimal images (alpine, `python:slim`) often
+  omit it. The probe already falls back to local time when the named timezone
+  cannot be loaded, so the guard works; installing `tzdata` just makes the reset
+  label exact.
+
+Tested directly on macOS. The Linux paths are exercised by the self-check's
+portability assertions and by running the `stat` logic against GNU `stat`, which
+is not the same as a full run on a Linux box — if you run it there, the
+self-check is the thing to run first.
 
 ## License
 

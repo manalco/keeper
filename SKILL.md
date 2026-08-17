@@ -12,7 +12,7 @@ running. This skill is the control surface: reading state and changing settings.
 
 ## How it works, in one pass
 
-- `~/.claude/hooks/keeper.sh probe` runs `claude -p "/usage"`. The CLI answers
+- `~/.claude/skills/keeper/hooks/keeper.sh probe` runs `claude -p "/usage"`. The CLI answers
   that locally, with no API request, so measuring costs **zero tokens**. It takes
   ~12s of wall clock, so the probe always runs detached and every hook decides
   from the cached reading in milliseconds.
@@ -31,12 +31,12 @@ running. This skill is the control surface: reading state and changing settings.
 Run these directly; they are plain shell and cost nothing but the call.
 
 ```bash
-bash ~/.claude/hooks/keeper.sh status        # percentage, reset time, paused?, reading age
-bash ~/.claude/hooks/keeper.sh probe         # force a fresh reading now (~12s)
-bash ~/.claude/hooks/keeper.sh threshold 90  # change the pause point (1-100)
-bash ~/.claude/hooks/keeper.sh off           # stop guarding
-bash ~/.claude/hooks/keeper.sh on            # resume guarding
-bash ~/.claude/hooks/keeper-selfcheck.sh     # 40 offline assertions, no tokens
+bash ~/.claude/skills/keeper/hooks/keeper.sh status        # percentage, reset time, paused?, reading age
+bash ~/.claude/skills/keeper/hooks/keeper.sh probe         # force a fresh reading now (~12s)
+bash ~/.claude/skills/keeper/hooks/keeper.sh threshold 90  # change the pause point (1-100)
+bash ~/.claude/skills/keeper/hooks/keeper.sh off           # stop guarding
+bash ~/.claude/skills/keeper/hooks/keeper.sh on            # resume guarding
+bash ~/.claude/skills/keeper/hooks/keeper-selfcheck.sh     # 66 offline assertions, no tokens
 ```
 
 `status` also prints `Gate last consulted: Ns ago`. If that line ever reads

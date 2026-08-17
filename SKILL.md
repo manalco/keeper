@@ -23,8 +23,13 @@ running. This skill is the control surface: reading state and changing settings.
   paused session needs nobody watching the clock.
 - The pause releases itself once the reset time passes; the cached percentage is
   set to 0 because the window genuinely restarts empty.
-- The statusline badge shows `[KEEPER:33%]` — green below 70%, amber to the
-  threshold, red as `[KEEPER:96% BLOCKED 2h14m]` while paused.
+- The statusline badge shows `[KEEPER:33%]`, coloured against the configured
+  threshold, and `[KEEPER:96% BLOCKED 2h14m]` while paused. Suffixes are graded:
+  `~` means the percentage is exact but the reset time is estimated, `?` means the
+  reading is older than its refresh interval, and `[KEEPER:!]` means there is no
+  usable reading at all. Only `!` means the guard is not guarding — do not report
+  `~` as a failure.
+- Runs on macOS and Linux; `status` reports anything degraded.
 
 ## Commands
 
@@ -36,7 +41,7 @@ bash ~/.claude/skills/keeper/hooks/keeper.sh probe         # force a fresh readi
 bash ~/.claude/skills/keeper/hooks/keeper.sh threshold 90  # change the pause point (1-100)
 bash ~/.claude/skills/keeper/hooks/keeper.sh off           # stop guarding
 bash ~/.claude/skills/keeper/hooks/keeper.sh on            # resume guarding
-bash ~/.claude/skills/keeper/hooks/keeper-selfcheck.sh     # 66 offline assertions, no tokens
+bash ~/.claude/skills/keeper/hooks/keeper-selfcheck.sh     # 80 offline assertions, no tokens
 ```
 
 `status` also prints `Gate last consulted: Ns ago`. If that line ever reads

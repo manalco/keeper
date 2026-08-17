@@ -42,7 +42,7 @@ case "$threshold" in ''|*[!0-9]*) threshold=95 ;; esac
 
 if [ "$enabled" != "1" ]; then badge "$GREY" ":OFF"; exit 0; fi
 
-pct=""; blocked=0; reset_epoch=""; fetched=""
+pct=""; blocked=0; reset_epoch=""; fetched=""; est=0
 if [ -f "$STATE" ]; then
   # Values are filtered to the characters a badge can legitimately contain, so
   # escape sequences or OSC hyperlinks in a tampered file cannot reach the
@@ -53,17 +53,23 @@ if [ -f "$STATE" ]; then
       blocked)     blocked="${v//[!01]/}" ;;
       reset_epoch) reset_epoch="${v//[!0-9]/}" ;;
       fetched_at)  fetched="${v//[!0-9]/}" ;;
+      reset_est)   est="${v//[!01]/}" ;;
     esac
   done < <(head -c 512 "$STATE" 2>/dev/null)
 fi
+[ -z "$est" ] && est=0
 [ "${#pct}" -gt 3 ] && pct=100
 [ -n "$pct" ] && [ "$pct" -gt 100 ] && pct=100
 [ -z "$blocked" ] && blocked=0
 
-# A broken probe is the failure mode that matters most, and it used to show up as
-# nothing at all.
-if [ -f "$PROBE_ERR" ]; then badge "$RED" ":!"; exit 0; fi
-if [ -z "$pct" ]; then badge "$GREY" ":?"; exit 0; fi
+# No usable percentage is the failure mode that matters most, and it used to show
+# up as nothing at all. `!` is reserved for exactly that — a guard with a known
+# reason for having no reading — because a badge that cries wolf over a working
+# guard trains you to ignore it.
+if [ -z "$pct" ]; then
+  if [ -f "$PROBE_ERR" ]; then badge "$RED" ":!"; else badge "$GREY" ":?"; fi
+  exit 0
+fi
 
 now=$(date +%s)
 
@@ -87,12 +93,15 @@ else color=$GREEN; fi
 
 # A reading nobody refreshed is flagged, on a bound that tightens with usage:
 # a flat 15 minutes was loosest exactly where the margin is thinnest.
-stale=""
+suffix=""
 if [ -n "$fetched" ] && [ "$fetched" -gt 0 ]; then
   limit=900
   [ "$pct" -ge 70 ] && limit=360
   [ "$pct" -ge 90 ] && limit=180
-  [ $(( now - fetched )) -gt "$limit" ] && stale="?"
+  [ $(( now - fetched )) -gt "$limit" ] && suffix="?"
 fi
+# The percentage is exact; only the reset time is guessed. `~` says that without
+# implying the number above it cannot be trusted.
+[ "$est" = "1" ] && suffix="$suffix~"
 
-badge "$color" ":${pct}%${stale}"
+badge "$color" ":${pct}%${suffix}"

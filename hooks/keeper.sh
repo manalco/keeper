@@ -121,8 +121,15 @@ atomic_write() { # path  (content on stdin)
 
 write_config() { printf 'threshold=%s\nenabled=%s\n' "$1" "$2" | atomic_write "$CONFIG"; }
 
-mtime() { # BSD first, GNU second; 0 when neither answers
-  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0
+mtime() { # modification time in epoch seconds, 0 when unobtainable
+  # GNU form first, then BSD. Chaining them the other way looked equivalent but
+  # was not: GNU stat reads `-f %m` as a *filename*, prints a multi-line
+  # filesystem report to stdout, and exits 1 — so the fallback ran too and the
+  # caller got the report and the number concatenated, breaking every arithmetic
+  # comparison on Linux. The numeric guard is what makes the order safe.
+  local v
+  v=$(stat -c %Y "$1" 2>/dev/null) || v=$(stat -f %m "$1" 2>/dev/null) || v=""
+  case "$v" in ''|*[!0-9]*) printf '0' ;; *) printf '%s' "$v" ;; esac
 }
 
 # Refresh cadence. Far from the limit the number barely matters, so polling is
@@ -284,18 +291,24 @@ if mon and mon.capitalize() in months:
     try:
         target = now.replace(month=months[mon.capitalize()], day=int(day),
                              hour=hh, minute=mm, second=0, microsecond=0)
-        # A date near a year boundary can land in the past; the window is 5h, so
-        # the only sane reading is the next occurrence.
-        if target < now - timedelta(hours=1):
-            target = target.replace(year=target.year + 1)
     except ValueError:
         # An impossible date (Feb 30, day 31 of a 30-day month) must not cost us
         # a percentage that parsed perfectly well.
         target = None
 if target is None:
     target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-    if target <= now:
-        target += timedelta(days=1)
+
+# A label in the past is the normal reading in the seconds after a rollover: for
+# a few moments /usage still names the window that just ended. The window is 5h
+# long, so the next reset is that label plus 5h — treating it as unreadable
+# instead raised a scary badge on every single rollover. Stepping rather than
+# jumping also covers a label stale by more than one window.
+steps = 0
+while target <= now and steps < 4:
+    target += timedelta(hours=5)
+    steps += 1
+if target <= now:
+    sys.exit(1)
 
 label = f"{(hh % 12) or 12}:{mm:02d}" + ("pm" if hh >= 12 else "am")
 print(int(target.timestamp()), label)
@@ -310,14 +323,19 @@ print(int(target.timestamp()), label)
   # reading meant one upstream rewording of the reset clause would disable the
   # guard at exactly the moment it matters. Guessing conservatively still lets
   # the threshold trip; the estimate is marked so nothing presents it as read.
-  if [ -z "$epoch" ] || [ "$epoch" -le "$now" ] || [ $((epoch - now)) -gt "$WINDOW_SECONDS" ]; then
+  # The label carries only minutes, and a reading taken moments after a rollover
+  # legitimately sits a whole window out, so the ceiling needs slack — without it
+  # a perfectly good reset time was rejected as nonsense.
+  if [ -z "$epoch" ] || [ "$epoch" -le "$now" ] || [ $((epoch - now)) -gt $((WINDOW_SECONDS + 300)) ]; then
     epoch=$((now + 900))
     label=""
     est=1
-    printf '%s\n' "unreadable reset time; using a 15-minute estimate" | atomic_write "$PROBE_ERR" 2>/dev/null
-  else
-    rm -f "$PROBE_ERR" 2>/dev/null
   fi
+  # The reading itself succeeded, so any earlier failure is over. An estimated
+  # reset is recorded in the state as reset_est, not as a probe error: the
+  # percentage — the number the whole guard turns on — is exact either way, and
+  # flagging it as a failure raised an alarming badge over a working guard.
+  rm -f "$PROBE_ERR" 2>/dev/null
 
   load_state || true
   write_state "$pct" "$epoch" "$label" "${S_blocked:-0}" "$est"

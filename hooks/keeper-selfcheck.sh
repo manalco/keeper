@@ -56,14 +56,22 @@ h = d.hour % 12 or 12
 print(f"resets {d.strftime('%b')} {d.day} at {h}:{d.minute:02d}{'pm' if d.hour >= 12 else 'am'}")
 PY
 }
-clause_nodate() { # hours ahead, no date, explicit timezone
+clause_nodate() { # hours ahead, no date, timezone named when available
   python3 - "$1" <<'PY'
 import sys, datetime
-from zoneinfo import ZoneInfo
-tz = ZoneInfo("America/Bogota")
+# A minimal Linux image (alpine, python:slim) ships no tzdata, so the named
+# timezone has to be optional here or the suite fails for a reason that has
+# nothing to do with Keeper.
+tz, suffix = None, ""
+try:
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo("America/Bogota")
+    suffix = " (America/Bogota)"
+except Exception:
+    pass
 d = datetime.datetime.now(tz) + datetime.timedelta(hours=float(sys.argv[1]))
 h = d.hour % 12 or 12
-print(f"resets {h}:{d.minute:02d}{'pm' if d.hour >= 12 else 'am'} (America/Bogota)")
+print(f"resets {h}:{d.minute:02d}{'pm' if d.hour >= 12 else 'am'}{suffix}")
 PY
 }
 
@@ -406,6 +414,67 @@ else bad "session block stays lean" "<120 words" "$words words"; fi
 
 new_home
 assert_contains "no reading still announces itself" "KEEPER" "$(bash "$KEEPER" session-start 2>/dev/null)"
+
+# --- rollover ----------------------------------------------------------------
+# In the seconds after a window rolls over, /usage still names the window that
+# just ended. Treating that normal reading as unreadable raised an alarming badge
+# on every rollover and pinned it there for the length of the failure backoff.
+echo "rollover:"
+new_home
+probe_with 2 "$(clause_in -0.1)"
+re=$(state reset_epoch); now=$(date +%s)
+if [ -n "$re" ] && [ "$re" -gt "$now" ] && [ $((re - now)) -gt 17000 ]; then
+  ok "a just-passed reset rolls forward one window"
+else
+  bad "a just-passed reset rolls forward one window" ">17000s ahead" "$(( ${re:-0} - now ))s"
+fi
+assert_eq "a just-passed reset is not an estimate" "0" "$(state reset_est)"
+assert_eq "a just-passed reset records no probe error" "absent" \
+  "$([ -f "$KEEPER_HOME/.keeper-probe-error" ] && echo present || echo absent)"
+assert_not_contains "rollover does not raise the failure badge" ":!" "$(bash "$STATUSLINE" 2>/dev/null)"
+
+# A label stale by more than one window still resolves forward.
+new_home
+probe_with 5 "$(clause_in -6)"
+re=$(state reset_epoch); now=$(date +%s)
+if [ -n "$re" ] && [ "$re" -gt "$now" ]; then ok "a badly stale reset still lands in the future"
+else bad "a badly stale reset still lands in the future" "future epoch" "$re"; fi
+
+# --- degraded but working ----------------------------------------------------
+echo "degraded:"
+new_home
+probe_with 44 "resets in 12 minutes"
+assert_eq "unreadable clause marks an estimate" "1" "$(state reset_est)"
+badge=$(bash "$STATUSLINE" 2>/dev/null)
+# The percentage is exact even when the reset time is guessed, so the badge must
+# not claim the guard is broken.
+assert_contains "estimated reset shows a tilde" "44%~" "$badge"
+assert_not_contains "estimated reset is not flagged as failure" ":!" "$badge"
+assert_contains "status marks the reset as estimated" "estimated" "$(bash "$KEEPER" status 2>&1)"
+
+# The failure badge is reserved for having no usable reading at all.
+new_home
+KEEPER_PROBE_FIXTURE=/nonexistent-fixture bash "$KEEPER" probe >/dev/null 2>&1
+assert_contains "no reading plus a known reason shows the failure badge" ":!" \
+  "$(bash "$STATUSLINE" 2>/dev/null)"
+
+# --- portability -------------------------------------------------------------
+echo "portability:"
+# GNU stat reads `-f %m` as a filename, prints a filesystem report to stdout and
+# exits 1, so trying the BSD form first fed that report and the number, joined,
+# into arithmetic on every Linux box. The order matters and must not regress.
+gnu_line=$(grep -n 'stat -c %Y' "$KEEPER" | head -n1 | cut -d: -f1)
+bsd_line=$(grep -n 'stat -f %m' "$KEEPER" | head -n1 | cut -d: -f1)
+if [ -n "$gnu_line" ] && [ -n "$bsd_line" ] && [ "$gnu_line" -le "$bsd_line" ]; then
+  ok "stat tries the GNU form before the BSD form"
+else
+  bad "stat tries the GNU form before the BSD form" "GNU first" "GNU:${gnu_line:-none} BSD:${bsd_line:-none}"
+fi
+# Whatever stat prints, a non-numeric answer must never reach arithmetic.
+assert_contains "mtime validates its result numerically" '[!0-9]' \
+  "$(sed -n '/^mtime()/,/^}/p' "$KEEPER")"
+assert_contains "notifications fall back off macOS" "notify-send" "$(cat "$KEEPER")"
+assert_contains "timeout is used only when present" 'command -v timeout' "$(cat "$KEEPER")"
 
 # --- misc --------------------------------------------------------------------
 echo "misc:"

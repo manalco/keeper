@@ -10,6 +10,12 @@
 # wall clock, which is why the probe always runs detached and every hook here
 # decides from cache. A hook that blocked on the probe would tax every tool call.
 #
+# Releasing the gate is not the same as resuming the work. The turn that hit the
+# pause has already ended by the time the window rolls over, and nothing re-invokes
+# the model, so the job used to sit there until a human noticed and typed. The Stop
+# hook closes that gap: it holds the paused turn open across the rollover and then
+# tells the model to carry on. Waiting costs no tokens — it is a sleeping shell.
+#
 # Two failure directions matter, and they are not symmetric. Failing open (never
 # blocking) wastes the budget this exists to protect. Failing closed (blocking
 # forever) is worse: while the gate denies, the very command that would lift it
@@ -18,6 +24,7 @@
 #
 # Subcommands:
 #   check          PreToolUse hook — allow silently, or deny while blocked
+#   stop           Stop hook — hold the paused turn open until the window resets
 #   session-start  SessionStart hook — short context block + opportunistic refresh
 #   probe          fetch usage, update state (normally spawned detached)
 #   status         human-readable state, for the /keeper skill
@@ -40,6 +47,8 @@ LASTCHECK="$KEEPER_HOME/.keeper-lastcheck"
 PROBE_ERR="$KEEPER_HOME/.keeper-probe-error"
 PROBE_ATTEMPT="$KEEPER_HOME/.keeper-probe-attempt"
 PROBE_CWD="$KEEPER_HOME/.keeper-probe"
+RESUMED="$KEEPER_HOME/.keeper-resumed"
+HOLD="$KEEPER_HOME/.keeper-hold"
 DEFAULT_THRESHOLD=95
 WINDOW_SECONDS=18000
 
@@ -50,7 +59,7 @@ mkdir -p "$KEEPER_HOME" 2>/dev/null
 # them is right, but refusing *silently* left the operator with no diagnostic,
 # so the refusal is recorded and every human-facing subcommand reports it.
 REFUSED=""
-for f in "$STATE" "$CONFIG" "$LASTCHECK" "$TIMER"; do
+for f in "$STATE" "$CONFIG" "$LASTCHECK" "$TIMER" "$RESUMED"; do
   if [ -L "$f" ]; then REFUSED="$f"; break; fi
 done
 
@@ -429,6 +438,107 @@ until_phrase() { # "until 3:50pm" when the label is trustworthy, else silence
   if [ -n "$S_label" ] && [ "${S_est:-0}" != "1" ]; then printf ', until %s' "$S_label"; fi
 }
 
+# Lifting a pause. The stale high reading has to go with it, or the very next
+# tool call re-blocks; fetched_at is zeroed rather than inventing a percentage,
+# which forces an immediate fresh probe.
+release() {
+  set_field blocked 0
+  set_field pct 0
+  set_field fetched_at 0
+  disarm_timer
+  S_pct=0; S_fetched=0; S_blocked=0
+}
+
+# ---------------------------------------------------------------------------
+# stop — hold the paused turn open across the rollover
+# ---------------------------------------------------------------------------
+do_stop() {
+  [ -n "$REFUSED" ] && exit 0
+  [ "$(enabled)" = "1" ] || exit 0
+  load_state || exit 0
+  # Only a turn that actually hit the pause is held; any other stop is none of
+  # Keeper's business and must cost nothing.
+  [ "$S_blocked" = "1" ] || exit 0
+  # An estimated reset is a 15-minute placeholder, not a reading. Waiting it out
+  # and then sending the model back to work would restart the job with the window
+  # possibly still full — the one outcome worse than stopping too early.
+  [ "${S_est:-0}" = "1" ] && exit 0
+
+  # A Stop hook that continues its own continuation loops forever and burns the
+  # window it exists to protect. Two things prevent it, both on this side: the
+  # pause is lifted and read back from disk before the answer is written, so the
+  # next stop finds nothing to hold, and a resume that fired in the last minute
+  # refuses to fire again.
+  #
+  # The harness's own `stop_hook_active` marker is deliberately not consulted.
+  # Reading stdin at all lets a pipe that is never written hang the end of the
+  # turn, and the marker stays true for every stop in a chain the hook itself
+  # continued — so honouring it would silently kill the resume the second time a
+  # long session hit the wall, which is exactly the case this exists for.
+  [ $(( $(date +%s) - $(mtime "$RESUMED") )) -lt 60 ] && exit 0
+
+  # The pause is recorded once for the account, not once per session, so every
+  # open window sees blocked=1 and would hold its own turn and be force-resumed
+  # at the rollover — N model turns spending the window that was just protected,
+  # in sessions with no interrupted work to continue. One holder at a time: the
+  # first turn to end during the pause. mkdir is the lock, as in the probe.
+  if ! mkdir "$HOLD" 2>/dev/null; then
+    local hpid
+    hpid=$(head -c 16 "$HOLD/pid" 2>/dev/null | tr -cd '0-9')
+    # A holder killed with its session must not lock the feature out forever.
+    [ -n "$hpid" ] && kill -0 "$hpid" 2>/dev/null && exit 0
+    mv "$HOLD" "$HOLD.stale.$$" 2>/dev/null || exit 0
+    rm -rf "$HOLD.stale.$$" 2>/dev/null
+    mkdir "$HOLD" 2>/dev/null || exit 0
+  fi
+  printf '%s' "$$" > "$HOLD/pid" 2>/dev/null
+  trap 'rm -rf "$HOLD" 2>/dev/null' EXIT
+
+  # Sleep in short spans instead of one long one, re-reading state each time, so
+  # a pause lifted from another terminal (`threshold 99`, `off`) is noticed and
+  # the turn ends rather than sitting until the original reset time.
+  local now deadline left rollover=0
+  now=$(date +%s)
+  deadline=$(( now + WINDOW_SECONDS + 300 ))
+  while :; do
+    load_state || break
+    [ "$S_blocked" = "1" ] || break
+    [ "$(enabled)" = "1" ] || break
+    now=$(date +%s)
+    [ "$now" -ge "$deadline" ] && break
+    # A corrupt or missing reset time is not a rollover and never becomes one, so
+    # the wait ends here rather than hanging on a moment that will not arrive.
+    # Releasing the pause is left to the gate, which does it on the next call.
+    [ -n "$S_reset" ] && [ "$S_reset" -gt 0 ] || break
+    left=$(( S_reset - now ))
+    if [ "$left" -le 0 ]; then rollover=1; break; fi
+    [ "$left" -gt 30 ] && left=30
+    sleep "$left"
+  done
+
+  # Every other way out of that loop — state gone, guard switched off, cap
+  # reached, reset unreadable — ends the turn silently. Only the window actually
+  # rolling over may put the model back to work.
+  [ "$rollover" = "1" ] || exit 0
+
+  release
+  # A release that did not reach disk leaves blocked=1 behind, and then every
+  # following turn end would resume again, one turn a minute, for as long as the
+  # disk stays unwritable. Confirm the pause is really gone before answering.
+  load_state || exit 0
+  [ "$S_blocked" = "1" ] && exit 0
+  maybe_refresh
+  # Releasing disarms the timer that would have announced the rollover, and the
+  # timer may never have been armed at all, so the announcement is made here
+  # rather than left to whichever of the two woke first.
+  notify "Session window reset — resuming the paused work."
+  touch "$RESUMED" 2>/dev/null
+  # Static text and nothing from disk, so the state file cannot reshape this JSON
+  # or slip instructions into the turn it restarts.
+  printf '{"decision":"block","reason":"KEEPER RESUME — the 5-hour session window has reset and the pause is lifted. Pick the interrupted work back up exactly where the pause stopped you and finish it. Do not wait for the user to ask again, and do not re-summarise what happened; just carry on and say briefly that the window reset."}\n'
+  exit 0
+}
+
 # ---------------------------------------------------------------------------
 # check — the PreToolUse gate
 # ---------------------------------------------------------------------------
@@ -451,20 +561,13 @@ do_check() {
     # value an unbreakable pause: every tool denied forever, including the one
     # that would lift it, so the only way out was an external terminal.
     if [ -z "$S_reset" ] || [ "$S_reset" -le 0 ] || [ "$left" -le 0 ]; then
-      set_field blocked 0
-      # The window genuinely restarts empty, so a stale high reading has to go or
-      # the very next tool call re-blocks. fetched_at is zeroed instead of
-      # inventing a percentage, which forces an immediate refresh.
-      set_field pct 0
-      set_field fetched_at 0
-      disarm_timer
+      release
       notify "Session window reset — Keeper released the pause."
-      S_pct=0; S_fetched=0
       maybe_refresh
       exit 0
     fi
     arm_timer "$left" "$S_reset"
-    deny "KEEPER PAUSE ACTIVE. Session window at ${S_pct:-unknown}% (limit ${th}%). All tools stay blocked for $(human_left "$left")$(until_phrase). Stop now: do not retry this tool, do not switch tools, do not keep working in prose. Tell the user Keeper paused the session and that you will resume after the window resets."
+    deny "KEEPER PAUSE ACTIVE. Session window at ${S_pct:-unknown}% (limit ${th}%). All tools stay blocked for $(human_left "$left")$(until_phrase). Stop now: do not retry this tool, do not switch tools, do not keep working in prose. Tell the user Keeper paused the session and that it will resume this work by itself once the window resets."
     exit 0
   fi
 
@@ -477,7 +580,7 @@ do_check() {
     set_field blocked 1
     arm_timer "$left" "${S_reset:-0}"
     notify "Session window at ${S_pct}% — work paused$(until_phrase)."
-    deny "KEEPER TRIPPED at ${S_pct}% of the 5-hour session window (limit ${th}%). All tools are now blocked for $(human_left "$left")$(until_phrase). Stop immediately so the remaining budget is not spent: do not retry, do not continue in prose. Tell the user Keeper paused the session to protect the window, and that it releases itself when the window resets."
+    deny "KEEPER TRIPPED at ${S_pct}% of the 5-hour session window (limit ${th}%). All tools are now blocked for $(human_left "$left")$(until_phrase). Stop immediately so the remaining budget is not spent: do not retry, do not continue in prose. Tell the user Keeper paused the session to protect the window, and that it will resume this work by itself once the window resets."
     exit 0
   fi
   exit 0
@@ -542,6 +645,7 @@ do_status() {
 
 case "${1:-check}" in
   check)         do_check ;;
+  stop)          do_stop ;;
   session-start) do_session_start ;;
   probe)         do_probe ;;
   status)        do_status ;;
@@ -560,5 +664,5 @@ case "${1:-check}" in
     printf 'Keeper threshold set to %s%%\n' "$v" ;;
   on)  write_config "$(threshold)" 1; printf 'Keeper enabled (threshold %s%%)\n' "$(threshold)" ;;
   off) write_config "$(threshold)" 0; set_field blocked 0; disarm_timer; printf 'Keeper disabled\n' ;;
-  *)   printf 'usage: keeper.sh {check|session-start|probe|status|threshold N|on|off}\n'; exit 1 ;;
+  *)   printf 'usage: keeper.sh {check|stop|session-start|probe|status|threshold N|on|off}\n'; exit 1 ;;
 esac

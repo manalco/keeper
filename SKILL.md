@@ -23,6 +23,12 @@ running. This skill is the control surface: reading state and changing settings.
   paused session needs nobody watching the clock.
 - The pause releases itself once the reset time passes; the cached percentage is
   set to 0 because the window genuinely restarts empty.
+- `Stop` holds the interrupted turn open across the rollover and then answers
+  `block`, which restarts the same turn with its context intact — so the work
+  resumes on its own instead of waiting for the user to type. Waiting is a
+  sleeping shell and costs nothing. Only a real rollover restarts the turn: an
+  estimated reset time, a guard switched off mid-wait, or an unreadable state
+  file all end the turn quietly instead.
 - The statusline badge shows `[KEEPER:33%]`, coloured against the configured
   threshold, and `[KEEPER:96% BLOCKED 2h14m]` while paused. Suffixes are graded:
   `~` means the percentage is exact but the reset time is estimated, `?` means the
@@ -41,7 +47,7 @@ bash ~/.claude/skills/keeper/hooks/keeper.sh probe         # force a fresh readi
 bash ~/.claude/skills/keeper/hooks/keeper.sh threshold 90  # change the pause point (1-100)
 bash ~/.claude/skills/keeper/hooks/keeper.sh off           # stop guarding
 bash ~/.claude/skills/keeper/hooks/keeper.sh on            # resume guarding
-bash ~/.claude/skills/keeper/hooks/keeper-selfcheck.sh     # 80 offline assertions, no tokens
+bash ~/.claude/skills/keeper/hooks/keeper-selfcheck.sh     # 108 offline assertions, no tokens
 ```
 
 `status` also prints `Gate last consulted: Ns ago`. If that line ever reads
@@ -64,12 +70,20 @@ bug and not something to route around. Stop on the spot: no retrying the tool, n
 substituting a different tool, no pressing on in prose as if the work continued.
 
 Tell the user plainly that Keeper paused the session, at what percentage, and when
-it releases. Then wait. Working around the pause defeats the entire point — the
-budget it is protecting is what the next session needs to finish the job.
+it releases — and that the work resumes by itself, so nobody has to sit and watch.
+Then end the turn: ending it is what hands control to the `Stop` hook, which holds
+the turn open and restarts it at the rollover. Working around the pause defeats
+the entire point — the budget it is protecting is what finishes the job.
+
+When that restart arrives it reads `KEEPER RESUME`. Continue the interrupted work
+straight away; do not re-open the question with the user or replay what happened.
 
 ## Limits worth stating honestly
 
 Keeper gates tools, not text, so it cannot physically stop a reply from being
-written; the denial instructs the stop. And a subagent already mid-tool-call
+written; the denial instructs the stop. The automatic resume needs the `Stop`
+hook to be allowed to run for the length of the wait (`timeout: 18420` in
+settings); if the harness kills it earlier, the pause still releases but the work
+waits for the user's next message. And a subagent already mid-tool-call
 finishes that call — the block lands on its next one, which is part of why the
 default threshold leaves 5% of headroom rather than sitting at 99%.

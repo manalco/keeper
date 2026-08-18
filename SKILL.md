@@ -45,7 +45,7 @@ bash ~/.claude/skills/keeper/hooks/keeper.sh probe         # force a fresh readi
 bash ~/.claude/skills/keeper/hooks/keeper.sh threshold 90  # change the pause point (1-100)
 bash ~/.claude/skills/keeper/hooks/keeper.sh off           # stop guarding
 bash ~/.claude/skills/keeper/hooks/keeper.sh on            # resume guarding
-bash ~/.claude/skills/keeper/hooks/keeper-selfcheck.sh     # 93 offline assertions, no tokens
+bash ~/.claude/skills/keeper/hooks/keeper-selfcheck.sh     # 96 offline assertions, no tokens
 ```
 
 `status` also prints `Gate last consulted: Ns ago`. If that line ever reads
@@ -80,7 +80,7 @@ straight away; do not re-open the question with the user or replay what happened
 
 Keeper gates tools, not text, so it cannot physically stop a reply from being
 written; the denial instructs the stop. The automatic resume needs the `Stop`
-hook to be allowed to run for the length of the wait (`timeout: 18300` in
+hook to be allowed to run for the length of the wait (`timeout: 18420` in
 settings); if the harness kills it earlier, the pause still releases but the work
 waits for the user's next message. And a subagent already mid-tool-call
 finishes that call — the block lands on its next one, which is part of why the

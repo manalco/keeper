@@ -503,13 +503,36 @@ else
 fi
 
 # Continuing a turn that the hook itself continued is how a stop hook loops
-# forever, burning the window it exists to protect.
+# forever, burning the window it exists to protect. Two independent things stop
+# that: resuming clears the pause first, so the next stop finds nothing to hold,
+# and a resume that just happened is refused outright.
 new_home
 probe_with 96 "$(clause_in 2)"
 bash "$KEEPER" check >/dev/null 2>&1
 set_field reset_epoch "$(( $(date +%s) - 10 ))"
-assert_eq "an already-continued turn is never continued again" "" \
-  "$(printf '{"stop_hook_active": true}' | bash "$KEEPER" stop 2>/dev/null)"
+bash "$KEEPER" stop </dev/null >/dev/null 2>&1
+assert_eq "the turn after a resume is not continued again" "" \
+  "$(bash "$KEEPER" stop </dev/null 2>/dev/null)"
+
+# Even a state file that claims the pause is still on cannot get a second resume
+# out of Keeper moments after the first — the tight loop is the expensive one.
+set_field blocked 1
+set_field reset_epoch "$(( $(date +%s) - 10 ))"
+assert_eq "a fresh resume refuses to fire twice" "" \
+  "$(bash "$KEEPER" stop </dev/null 2>/dev/null)"
+
+# Nothing on stdin may hold the hook: a caller that opens the pipe and never
+# writes would hang the turn end for as long as the harness allows.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) - 10 ))"
+s=$(date +%s)
+out=$(bash "$KEEPER" stop < <(sleep 20) 2>/dev/null)
+el=$(( $(date +%s) - s ))
+if [ "$el" -lt 5 ]; then ok "an open stdin pipe does not hold the hook (${el}s)"
+else bad "an open stdin pipe does not hold the hook" "<5s" "${el}s"; fi
+assert_contains "and it still continues the turn" '"decision":"block"' "$out"
 
 # The whole point: the hook holds the turn open until the window rolls over.
 new_home

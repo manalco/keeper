@@ -1,7 +1,7 @@
 # Keeper
 
 [![status](https://img.shields.io/badge/status-active-108C4A?style=flat-square)](#)
-[![self--check](https://img.shields.io/badge/self--check-93%2F93%20passing-2E7D32?style=flat-square)](#self-check)
+[![self--check](https://img.shields.io/badge/self--check-96%2F96%20passing-2E7D32?style=flat-square)](#self-check)
 [![token cost](https://img.shields.io/badge/token%20cost-~69%20tokens%2Fsession-1565C0?style=flat-square)](#what-it-costs)
 [![probe](https://img.shields.io/badge/probe-0%20API%20calls-1565C0?style=flat-square)](#how-it-works)
 [![threshold](https://img.shields.io/badge/default%20threshold-95%25-D97706?style=flat-square)](#configuration)
@@ -109,10 +109,13 @@ with its full context, carries on where it stopped.
 
 Three properties matter more than the mechanism:
 
-- **It never loops.** A stop that Keeper itself continued carries
-  `stop_hook_active`, and Keeper declines to continue it a second time. A `Stop`
-  hook that re-blocks its own continuation would burn the window it exists to
-  protect.
+- **It never loops.** Lifting the pause is the first thing
+  the resume, so the stop that follows finds no pause to hold — and a resume that
+  fired in the last minute refuses to fire again even if the state file claims
+  otherwise. Keeper deliberately ignores the harness's `stop_hook_active` marker
+  on stdin: reading stdin at all lets a pipe that is never written hang the turn
+  end, and a fixed-size prefix scan misses the marker in a large payload. Neither
+  guard here depends on input.
 - **It never waits on a time that will not arrive.** A missing or corrupt reset
   epoch resumes immediately, the same fail-open rule the gate follows. The wait
   is also capped at one window plus five minutes.
@@ -121,8 +124,10 @@ Three properties matter more than the mechanism:
   30s wake rather than sitting until the original reset.
 
 Honest limit: this depends on the hook being allowed to run as long as the wait.
-Claude Code kills a hook at its configured `timeout`, so the wiring below sets
-`18300` seconds — one window plus slack. If a harness caps that lower, the hook
+Claude Code kills a hook at its configured `timeout`. Keeper caps its own wait at
+one window plus five minutes (18300s), so the wiring below sets `18420` — two
+minutes above that cap, because a timeout equal to the cap kills the hook at the
+same instant it would have answered. If a harness caps that lower, the hook
 is killed, the turn ends, and Keeper degrades to exactly the old behaviour: the
 pause still releases itself, the desktop notification still fires, and the work
 waits for you to type. Nothing is lost either way; the resume is what you lose.
@@ -137,7 +142,8 @@ waits for you to type. Nothing is lost either way; the resume is what you lose.
 | `SessionStart` block | ~69 (254 characters, 47 words, asserted under 120 words by the self-check) |
 | Trip event, per denied call | ~85 |
 | Holding a paused turn open | **0** — a sleeping shell, no model involved |
-| The resume itself | one ordinary turn, in the *new* window it just waited for |
+| The resume instruction | ~90 — the `reason` the hook injects to restart the turn |
+| The resumed turn itself | one ordinary turn, in the *new* window it just waited for |
 
 ## Configuration
 
@@ -160,9 +166,9 @@ Files:
 
 | Path | Role |
 |---|---|
-| `~/.claude/skills/keeper/hooks/keeper.sh` | probe, gate, session block, config |
+| `~/.claude/skills/keeper/hooks/keeper.sh` | probe, gate, session block, the held-open turn, config |
 | `~/.claude/skills/keeper/hooks/keeper-statusline.sh` | `[KEEPER:NN%]` badge |
-| `~/.claude/skills/keeper/hooks/keeper-selfcheck.sh` | 93 offline assertions |
+| `~/.claude/skills/keeper/hooks/keeper-selfcheck.sh` | 96 offline assertions |
 | `~/.claude/skills/keeper/SKILL.md` | the control-surface skill |
 | `~/.claude/.keeper-state` | cached reading (`pct`, `reset_epoch`, `blocked`) |
 | `~/.claude/.keeper-config` | `threshold=95`, `enabled=1` |
@@ -177,8 +183,8 @@ line exists because a misconfigured guard is indistinguishable from a quiet one.
 
 Wiring lives in `~/.claude/settings.json`: a `SessionStart` hook, a `PreToolUse`
 hook matching all tools, a `Stop` hook, and a segment appended to `statusLine`.
-The `Stop` hook is the one with a non-default timeout — it has to outlast the
-wait it is there to perform:
+The `Stop` hook is the one with a non-default timeout — it has to outlast
+Keeper's own 18300s cap on the wait:
 
 ```json
 "Stop": [
@@ -187,7 +193,7 @@ wait it is there to perform:
       {
         "type": "command",
         "command": "bash \"$HOME/.claude/skills/keeper/hooks/keeper.sh\" stop",
-        "timeout": 18300
+        "timeout": 18420
       }
     ]
   }
@@ -200,7 +206,7 @@ wait it is there to perform:
 bash ~/.claude/skills/keeper/hooks/keeper-selfcheck.sh
 ```
 
-93 assertions, fully offline against a fixture in a throwaway `KEEPER_HOME`, so
+96 assertions, fully offline against a fixture in a throwaway `KEEPER_HOME`, so
 it needs no network and never touches real state. Covers percentage parsing,
 timezone-aware reset math, the dateless `resets 3:50pm` variant, inclusive
 threshold, auto-release, the held-open turn and its loop guard, percentage
@@ -246,6 +252,12 @@ boundary is what the measures below have in common.
   `sh -c` string: a single quote in `KEEPER_HOME` or `CLAUDE_CONFIG_DIR`
   otherwise closed the quoting and the remainder became code in a detached
   process outliving the session.
+- **The held-open turn is the one place Keeper waits on the state file, and it
+  waits synchronously.** Any local process that can write `~/.claude/.keeper-state`
+  can set `blocked=1` with a distant `reset_epoch` and stall the end of a turn for
+  up to the 18300s cap. That is a real consequence of this design, stated rather
+  than hidden: the same write could already deny every tool indefinitely, the cap
+  and the harness timeout bound it, and interrupting the session ends it at once.
 - **`PATH` is pinned to system directories first**, so a venv, direnv, or
   `node_modules/.bin` shim cannot substitute the parser or the comparison tools.
 - **State is parsed field-by-field, never sourced**, and reads are capped at 512

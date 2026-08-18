@@ -47,6 +47,7 @@ LASTCHECK="$KEEPER_HOME/.keeper-lastcheck"
 PROBE_ERR="$KEEPER_HOME/.keeper-probe-error"
 PROBE_ATTEMPT="$KEEPER_HOME/.keeper-probe-attempt"
 PROBE_CWD="$KEEPER_HOME/.keeper-probe"
+RESUMED="$KEEPER_HOME/.keeper-resumed"
 DEFAULT_THRESHOLD=95
 WINDOW_SECONDS=18000
 
@@ -457,13 +458,17 @@ do_stop() {
   # Only a turn that actually hit the pause is held; any other stop is none of
   # Keeper's business and must cost nothing.
   [ "$S_blocked" = "1" ] || exit 0
-  # A stop this hook already continued must never be continued again: that is
-  # how a Stop hook loops forever and burns the window it exists to protect.
-  if [ ! -t 0 ]; then
-    case "$(head -c 4096 2>/dev/null)" in
-      *'"stop_hook_active"'*[Tt]rue*) exit 0 ;;
-    esac
-  fi
+  # A Stop hook that continues its own continuation loops forever and burns the
+  # window it exists to protect, so two independent things prevent it. First, a
+  # resume clears the pause before it answers, so the next stop finds nothing to
+  # hold. Second, this: a resume that fired moments ago refuses to fire again,
+  # which holds even if the state file is lying about the pause.
+  #
+  # The harness also marks a continued stop with `stop_hook_active` on stdin, but
+  # reading it is not worth the exposure — an unwritten pipe would hang the turn
+  # end for as long as the harness allows, and a fixed-size prefix scan misses the
+  # marker in a large payload anyway. Neither guard below depends on input.
+  [ $(( $(date +%s) - $(mtime "$RESUMED") )) -lt 60 ] && exit 0
 
   # Sleep in short spans instead of one long one, re-reading state each time, so
   # a pause lifted from another terminal (`threshold 99`, `off`) is noticed and
@@ -492,6 +497,7 @@ do_stop() {
     notify "Session window reset — resuming the paused work."
     maybe_refresh
   fi
+  touch "$RESUMED" 2>/dev/null
   # Static text and nothing from disk, so the state file cannot reshape this JSON
   # or slip instructions into the turn it restarts.
   printf '{"decision":"block","reason":"KEEPER RESUME — the 5-hour session window has reset and the pause is lifted. Pick the interrupted work back up exactly where the pause stopped you and finish it. Do not wait for the user to ask again, and do not re-summarise what happened; just carry on and say briefly that the window reset."}\n'

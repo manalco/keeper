@@ -476,6 +476,75 @@ assert_contains "mtime validates its result numerically" '[!0-9]' \
 assert_contains "notifications fall back off macOS" "notify-send" "$(cat "$KEEPER")"
 assert_contains "timeout is used only when present" 'command -v timeout' "$(cat "$KEEPER")"
 
+# --- resume after the rollover -----------------------------------------------
+# Releasing the gate does not restart a conversation: the paused turn had already
+# ended, so nothing re-invoked the model and the work sat waiting for a human to
+# type. The Stop hook is what keeps the turn alive across the rollover.
+echo "resume:"
+new_home
+probe_with 42 "$(clause_in 2)"
+assert_eq "no pause means the stop hook stays silent" "" "$(bash "$KEEPER" stop </dev/null 2>/dev/null)"
+
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) - 10 ))"
+out=$(bash "$KEEPER" stop </dev/null 2>/dev/null)
+assert_contains "a passed reset continues the turn" '"decision":"block"' "$out"
+assert_contains "the continuation says what to do" "KEEPER RESUME" "$out"
+assert_eq "resuming clears the pause" "0" "$(state blocked)"
+assert_eq "resuming zeroes the stale reading" "0" "$(state pct)"
+assert_eq "resuming disarms the timer" "absent" \
+  "$([ -f "$KEEPER_HOME/.keeper-timer.pid" ] && echo present || echo absent)"
+if printf '%s' "$out" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["decision"]=="block" else 1)' 2>/dev/null; then
+  ok "the continuation is valid JSON"
+else
+  bad "the continuation is valid JSON" "parseable block decision" "$out"
+fi
+
+# Continuing a turn that the hook itself continued is how a stop hook loops
+# forever, burning the window it exists to protect.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) - 10 ))"
+assert_eq "an already-continued turn is never continued again" "" \
+  "$(printf '{"stop_hook_active": true}' | bash "$KEEPER" stop 2>/dev/null)"
+
+# The whole point: the hook holds the turn open until the window rolls over.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) + 2 ))"
+s=$(date +%s)
+out=$(bash "$KEEPER" stop </dev/null 2>/dev/null)
+el=$(( $(date +%s) - s ))
+if [ "$el" -ge 1 ] && [ "$el" -lt 30 ]; then ok "the turn is held open until the reset (${el}s)"
+else bad "the turn is held open until the reset" "1-29s" "${el}s"; fi
+assert_contains "and then continues" '"decision":"block"' "$out"
+
+# A corrupt reset time must resume immediately, never wait on a time that will
+# not arrive — the same fail-open rule the gate follows.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch 0
+out=$(bash "$KEEPER" stop </dev/null 2>/dev/null)
+assert_contains "a bogus reset resumes instead of waiting forever" '"decision":"block"' "$out"
+
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+bash "$KEEPER" off >/dev/null 2>&1
+assert_eq "a disabled Keeper holds nothing open" "" "$(bash "$KEEPER" stop </dev/null 2>/dev/null)"
+
+# The deny text is the only thing the model reads at the moment it stops, so it
+# has to say the resume is automatic — otherwise it hands the job back to a human.
+new_home
+probe_with 96 "$(clause_in 2)"
+assert_contains "the denial promises the automatic resume" "resume" \
+  "$(bash "$KEEPER" check 2>/dev/null)"
+
 # --- misc --------------------------------------------------------------------
 echo "misc:"
 new_home

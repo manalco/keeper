@@ -1,7 +1,7 @@
 # Keeper
 
 [![status](https://img.shields.io/badge/status-active-108C4A?style=flat-square)](#)
-[![self--check](https://img.shields.io/badge/self--check-80%2F80%20passing-2E7D32?style=flat-square)](#self-check)
+[![self--check](https://img.shields.io/badge/self--check-93%2F93%20passing-2E7D32?style=flat-square)](#self-check)
 [![token cost](https://img.shields.io/badge/token%20cost-~69%20tokens%2Fsession-1565C0?style=flat-square)](#what-it-costs)
 [![probe](https://img.shields.io/badge/probe-0%20API%20calls-1565C0?style=flat-square)](#how-it-works)
 [![threshold](https://img.shields.io/badge/default%20threshold-95%25-D97706?style=flat-square)](#configuration)
@@ -11,8 +11,8 @@
 [![author](https://img.shields.io/badge/author-Manuel%20Alvarado-1F2937?style=flat-square)](#license)
 
 Guards the account's **5-hour Claude session window**. Watches the percentage,
-pauses every tool before the limit lands, arms a timer for the rollover, and
-releases itself when the window resets.
+pauses every tool before the limit lands, holds the interrupted turn open across
+the rollover, and picks the work back up by itself when the window resets.
 
 The problem it solves: hitting the window limit in the middle of a long task
 loses whatever was in flight. Keeper stops the work on purpose, with the budget
@@ -93,6 +93,40 @@ forward rather than flagging it. Reading it as unreadable instead put an alarmin
 badge on the statusline at every single rollover and pinned it there for the
 length of the failure backoff.
 
+### Resuming the work, not just releasing the gate
+
+Lifting the pause is not the same as continuing the job. The turn that hit the
+wall had already ended, and nothing re-invokes the model, so the work used to sit
+there — gate open, window fresh — until a human noticed and typed something. That
+was the whole point of pausing, lost at the last step.
+
+The `Stop` hook closes it. When a turn ends while the pause is active, Keeper
+holds that turn open instead of letting the session go idle: a sleeping shell,
+waking every 30s to re-read the state file, spending **nothing** while it waits.
+When the reset arrives it lifts the pause and answers the hook with a `block`
+decision, which is how a `Stop` hook says *keep going* — the same conversation,
+with its full context, carries on where it stopped.
+
+Three properties matter more than the mechanism:
+
+- **It never loops.** A stop that Keeper itself continued carries
+  `stop_hook_active`, and Keeper declines to continue it a second time. A `Stop`
+  hook that re-blocks its own continuation would burn the window it exists to
+  protect.
+- **It never waits on a time that will not arrive.** A missing or corrupt reset
+  epoch resumes immediately, the same fail-open rule the gate follows. The wait
+  is also capped at one window plus five minutes.
+- **A pause lifted by hand is noticed.** Raising the threshold from another
+  terminal releases the state file, and the sleeper picks that up on its next
+  30s wake rather than sitting until the original reset.
+
+Honest limit: this depends on the hook being allowed to run as long as the wait.
+Claude Code kills a hook at its configured `timeout`, so the wiring below sets
+`18300` seconds — one window plus slack. If a harness caps that lower, the hook
+is killed, the turn ends, and Keeper degrades to exactly the old behaviour: the
+pause still releases itself, the desktop notification still fires, and the work
+waits for you to type. Nothing is lost either way; the resume is what you lose.
+
 ## What it costs
 
 | Component | Tokens per session |
@@ -102,6 +136,8 @@ length of the failure backoff.
 | Statusline badge | **0** — the statusline is never part of context |
 | `SessionStart` block | ~69 (254 characters, 47 words, asserted under 120 words by the self-check) |
 | Trip event, per denied call | ~85 |
+| Holding a paused turn open | **0** — a sleeping shell, no model involved |
+| The resume itself | one ordinary turn, in the *new* window it just waited for |
 
 ## Configuration
 
@@ -126,7 +162,7 @@ Files:
 |---|---|
 | `~/.claude/skills/keeper/hooks/keeper.sh` | probe, gate, session block, config |
 | `~/.claude/skills/keeper/hooks/keeper-statusline.sh` | `[KEEPER:NN%]` badge |
-| `~/.claude/skills/keeper/hooks/keeper-selfcheck.sh` | 80 offline assertions |
+| `~/.claude/skills/keeper/hooks/keeper-selfcheck.sh` | 93 offline assertions |
 | `~/.claude/skills/keeper/SKILL.md` | the control-surface skill |
 | `~/.claude/.keeper-state` | cached reading (`pct`, `reset_epoch`, `blocked`) |
 | `~/.claude/.keeper-config` | `threshold=95`, `enabled=1` |
@@ -140,7 +176,23 @@ never consulted, the hooks are not loaded and Keeper is watching nothing — tha
 line exists because a misconfigured guard is indistinguishable from a quiet one.
 
 Wiring lives in `~/.claude/settings.json`: a `SessionStart` hook, a `PreToolUse`
-hook matching all tools, and a third segment appended to `statusLine`.
+hook matching all tools, a `Stop` hook, and a segment appended to `statusLine`.
+The `Stop` hook is the one with a non-default timeout — it has to outlast the
+wait it is there to perform:
+
+```json
+"Stop": [
+  {
+    "hooks": [
+      {
+        "type": "command",
+        "command": "bash \"$HOME/.claude/skills/keeper/hooks/keeper.sh\" stop",
+        "timeout": 18300
+      }
+    ]
+  }
+]
+```
 
 ## Self-check
 
@@ -148,11 +200,12 @@ hook matching all tools, and a third segment appended to `statusLine`.
 bash ~/.claude/skills/keeper/hooks/keeper-selfcheck.sh
 ```
 
-80 assertions, fully offline against a fixture in a throwaway `KEEPER_HOME`, so
+93 assertions, fully offline against a fixture in a throwaway `KEEPER_HOME`, so
 it needs no network and never touches real state. Covers percentage parsing,
 timezone-aware reset math, the dateless `resets 3:50pm` variant, inclusive
-threshold, auto-release, percentage zeroing, config validation, refresh cadence,
-badge colors, the countdown, and every item under Hardening below.
+threshold, auto-release, the held-open turn and its loop guard, percentage
+zeroing, config validation, refresh cadence, badge colors, the countdown, and
+every item under Hardening below.
 
 Reset clauses in the fixtures are generated relative to now. They were once
 hardcoded to a specific date and hour, which meant the suite proved nothing the

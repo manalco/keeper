@@ -10,6 +10,12 @@
 # wall clock, which is why the probe always runs detached and every hook here
 # decides from cache. A hook that blocked on the probe would tax every tool call.
 #
+# Releasing the gate is not the same as resuming the work. The turn that hit the
+# pause has already ended by the time the window rolls over, and nothing re-invokes
+# the model, so the job used to sit there until a human noticed and typed. The Stop
+# hook closes that gap: it holds the paused turn open across the rollover and then
+# tells the model to carry on. Waiting costs no tokens — it is a sleeping shell.
+#
 # Two failure directions matter, and they are not symmetric. Failing open (never
 # blocking) wastes the budget this exists to protect. Failing closed (blocking
 # forever) is worse: while the gate denies, the very command that would lift it
@@ -18,6 +24,7 @@
 #
 # Subcommands:
 #   check          PreToolUse hook — allow silently, or deny while blocked
+#   stop           Stop hook — hold the paused turn open until the window resets
 #   session-start  SessionStart hook — short context block + opportunistic refresh
 #   probe          fetch usage, update state (normally spawned detached)
 #   status         human-readable state, for the /keeper skill
@@ -429,6 +436,68 @@ until_phrase() { # "until 3:50pm" when the label is trustworthy, else silence
   if [ -n "$S_label" ] && [ "${S_est:-0}" != "1" ]; then printf ', until %s' "$S_label"; fi
 }
 
+# Lifting a pause. The stale high reading has to go with it, or the very next
+# tool call re-blocks; fetched_at is zeroed rather than inventing a percentage,
+# which forces an immediate fresh probe.
+release() {
+  set_field blocked 0
+  set_field pct 0
+  set_field fetched_at 0
+  disarm_timer
+  S_pct=0; S_fetched=0; S_blocked=0
+}
+
+# ---------------------------------------------------------------------------
+# stop — hold the paused turn open across the rollover
+# ---------------------------------------------------------------------------
+do_stop() {
+  [ -n "$REFUSED" ] && exit 0
+  [ "$(enabled)" = "1" ] || exit 0
+  load_state || exit 0
+  # Only a turn that actually hit the pause is held; any other stop is none of
+  # Keeper's business and must cost nothing.
+  [ "$S_blocked" = "1" ] || exit 0
+  # A stop this hook already continued must never be continued again: that is
+  # how a Stop hook loops forever and burns the window it exists to protect.
+  if [ ! -t 0 ]; then
+    case "$(head -c 4096 2>/dev/null)" in
+      *'"stop_hook_active"'*[Tt]rue*) exit 0 ;;
+    esac
+  fi
+
+  # Sleep in short spans instead of one long one, re-reading state each time, so
+  # a pause lifted from another terminal (`threshold 99`, `off`) is noticed and
+  # the work resumes at once rather than at the original reset time.
+  local now deadline left
+  now=$(date +%s)
+  deadline=$(( now + WINDOW_SECONDS + 300 ))
+  while :; do
+    load_state || break
+    [ "$S_blocked" = "1" ] || break
+    [ "$(enabled)" = "1" ] || break
+    now=$(date +%s)
+    [ "$now" -ge "$deadline" ] && break
+    # A corrupt or missing reset time resumes immediately. Waiting on a moment
+    # that will never arrive is the one failure this hook cannot recover from,
+    # since the turn it is holding is the only thing left running.
+    [ -n "$S_reset" ] && [ "$S_reset" -gt 0 ] || break
+    left=$(( S_reset - now ))
+    [ "$left" -le 0 ] && break
+    [ "$left" -gt 30 ] && left=30
+    sleep "$left"
+  done
+
+  if [ "${S_blocked:-0}" = "1" ]; then
+    release
+    notify "Session window reset — resuming the paused work."
+    maybe_refresh
+  fi
+  # Static text and nothing from disk, so the state file cannot reshape this JSON
+  # or slip instructions into the turn it restarts.
+  printf '{"decision":"block","reason":"KEEPER RESUME — the 5-hour session window has reset and the pause is lifted. Pick the interrupted work back up exactly where the pause stopped you and finish it. Do not wait for the user to ask again, and do not re-summarise what happened; just carry on and say briefly that the window reset."}\n'
+  exit 0
+}
+
 # ---------------------------------------------------------------------------
 # check — the PreToolUse gate
 # ---------------------------------------------------------------------------
@@ -451,20 +520,13 @@ do_check() {
     # value an unbreakable pause: every tool denied forever, including the one
     # that would lift it, so the only way out was an external terminal.
     if [ -z "$S_reset" ] || [ "$S_reset" -le 0 ] || [ "$left" -le 0 ]; then
-      set_field blocked 0
-      # The window genuinely restarts empty, so a stale high reading has to go or
-      # the very next tool call re-blocks. fetched_at is zeroed instead of
-      # inventing a percentage, which forces an immediate refresh.
-      set_field pct 0
-      set_field fetched_at 0
-      disarm_timer
+      release
       notify "Session window reset — Keeper released the pause."
-      S_pct=0; S_fetched=0
       maybe_refresh
       exit 0
     fi
     arm_timer "$left" "$S_reset"
-    deny "KEEPER PAUSE ACTIVE. Session window at ${S_pct:-unknown}% (limit ${th}%). All tools stay blocked for $(human_left "$left")$(until_phrase). Stop now: do not retry this tool, do not switch tools, do not keep working in prose. Tell the user Keeper paused the session and that you will resume after the window resets."
+    deny "KEEPER PAUSE ACTIVE. Session window at ${S_pct:-unknown}% (limit ${th}%). All tools stay blocked for $(human_left "$left")$(until_phrase). Stop now: do not retry this tool, do not switch tools, do not keep working in prose. Tell the user Keeper paused the session and that it will resume this work by itself once the window resets."
     exit 0
   fi
 
@@ -477,7 +539,7 @@ do_check() {
     set_field blocked 1
     arm_timer "$left" "${S_reset:-0}"
     notify "Session window at ${S_pct}% — work paused$(until_phrase)."
-    deny "KEEPER TRIPPED at ${S_pct}% of the 5-hour session window (limit ${th}%). All tools are now blocked for $(human_left "$left")$(until_phrase). Stop immediately so the remaining budget is not spent: do not retry, do not continue in prose. Tell the user Keeper paused the session to protect the window, and that it releases itself when the window resets."
+    deny "KEEPER TRIPPED at ${S_pct}% of the 5-hour session window (limit ${th}%). All tools are now blocked for $(human_left "$left")$(until_phrase). Stop immediately so the remaining budget is not spent: do not retry, do not continue in prose. Tell the user Keeper paused the session to protect the window, and that it will resume this work by itself once the window resets."
     exit 0
   fi
   exit 0
@@ -542,6 +604,7 @@ do_status() {
 
 case "${1:-check}" in
   check)         do_check ;;
+  stop)          do_stop ;;
   session-start) do_session_start ;;
   probe)         do_probe ;;
   status)        do_status ;;
@@ -560,5 +623,5 @@ case "${1:-check}" in
     printf 'Keeper threshold set to %s%%\n' "$v" ;;
   on)  write_config "$(threshold)" 1; printf 'Keeper enabled (threshold %s%%)\n' "$(threshold)" ;;
   off) write_config "$(threshold)" 0; set_field blocked 0; disarm_timer; printf 'Keeper disabled\n' ;;
-  *)   printf 'usage: keeper.sh {check|session-start|probe|status|threshold N|on|off}\n'; exit 1 ;;
+  *)   printf 'usage: keeper.sh {check|stop|session-start|probe|status|threshold N|on|off}\n'; exit 1 ;;
 esac

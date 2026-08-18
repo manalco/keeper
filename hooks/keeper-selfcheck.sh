@@ -476,6 +476,194 @@ assert_contains "mtime validates its result numerically" '[!0-9]' \
 assert_contains "notifications fall back off macOS" "notify-send" "$(cat "$KEEPER")"
 assert_contains "timeout is used only when present" 'command -v timeout' "$(cat "$KEEPER")"
 
+# --- resume after the rollover -----------------------------------------------
+# Releasing the gate does not restart a conversation: the paused turn had already
+# ended, so nothing re-invoked the model and the work sat waiting for a human to
+# type. The Stop hook is what keeps the turn alive across the rollover.
+echo "resume:"
+new_home
+probe_with 42 "$(clause_in 2)"
+assert_eq "no pause means the stop hook stays silent" "" "$(bash "$KEEPER" stop </dev/null 2>/dev/null)"
+
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) - 10 ))"
+out=$(bash "$KEEPER" stop </dev/null 2>/dev/null)
+assert_contains "a passed reset continues the turn" '"decision":"block"' "$out"
+assert_contains "the continuation says what to do" "KEEPER RESUME" "$out"
+assert_eq "resuming clears the pause" "0" "$(state blocked)"
+assert_eq "resuming zeroes the stale reading" "0" "$(state pct)"
+assert_eq "resuming disarms the timer" "absent" \
+  "$([ -f "$KEEPER_HOME/.keeper-timer.pid" ] && echo present || echo absent)"
+if printf '%s' "$out" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["decision"]=="block" else 1)' 2>/dev/null; then
+  ok "the continuation is valid JSON"
+else
+  bad "the continuation is valid JSON" "parseable block decision" "$out"
+fi
+
+# Continuing a turn that the hook itself continued is how a stop hook loops
+# forever, burning the window it exists to protect. Two independent things stop
+# that: resuming clears the pause first, so the next stop finds nothing to hold,
+# and a resume that just happened is refused outright.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) - 10 ))"
+bash "$KEEPER" stop </dev/null >/dev/null 2>&1
+assert_eq "the turn after a resume is not continued again" "" \
+  "$(bash "$KEEPER" stop </dev/null 2>/dev/null)"
+
+# Even a state file that claims the pause is still on cannot get a second resume
+# out of Keeper moments after the first — the tight loop is the expensive one.
+set_field blocked 1
+set_field reset_epoch "$(( $(date +%s) - 10 ))"
+assert_eq "a fresh resume refuses to fire twice" "" \
+  "$(bash "$KEEPER" stop </dev/null 2>/dev/null)"
+
+# Nothing on stdin may hold the hook: a caller that opens the pipe and never
+# writes would hang the turn end for as long as the harness allows.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) - 10 ))"
+s=$(date +%s)
+out=$(bash "$KEEPER" stop < <(sleep 20) 2>/dev/null)
+el=$(( $(date +%s) - s ))
+if [ "$el" -lt 5 ]; then ok "an open stdin pipe does not hold the hook (${el}s)"
+else bad "an open stdin pipe does not hold the hook" "<5s" "${el}s"; fi
+assert_contains "and it still continues the turn" '"decision":"block"' "$out"
+
+# The whole point: the hook holds the turn open until the window rolls over.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) + 2 ))"
+s=$(date +%s)
+out=$(bash "$KEEPER" stop </dev/null 2>/dev/null)
+el=$(( $(date +%s) - s ))
+if [ "$el" -ge 1 ] && [ "$el" -lt 30 ]; then ok "the turn is held open until the reset (${el}s)"
+else bad "the turn is held open until the reset" "1-29s" "${el}s"; fi
+assert_contains "and then continues" '"decision":"block"' "$out"
+
+# Only a real rollover may restart a turn. A corrupt reset time is not one: it
+# must neither wait on a moment that will not arrive nor drive the model back to
+# work on a window that may still be full. It ends the turn, and the gate's own
+# fail-open path releases the pause on the next tool call.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch 0
+s=$(date +%s)
+assert_eq "a corrupt reset ends the turn instead of resuming it" "" \
+  "$(bash "$KEEPER" stop </dev/null 2>/dev/null)"
+if [ $(( $(date +%s) - s )) -lt 5 ]; then ok "and it does not wait on it"
+else bad "and it does not wait on it" "<5s" "$(( $(date +%s) - s ))s"; fi
+
+# An estimated reset is a placeholder 15 minutes out, not a reading. Resuming on
+# it would send the model back to work with the window still at 96%.
+new_home
+probe_with 96 "resets in 12 minutes"
+bash "$KEEPER" check >/dev/null 2>&1
+assert_eq "an estimated reset never restarts a turn" "" \
+  "$(bash "$KEEPER" stop </dev/null 2>/dev/null)"
+
+# Disabling the guard mid-wait, deleting its state, or hitting the cap are all
+# reasons to stop waiting — none of them is a rollover, so none may resume.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) - 10 ))"
+rm -f "$KEEPER_HOME/.keeper-state"
+assert_eq "an unreadable state ends the turn" "" \
+  "$(bash "$KEEPER" stop </dev/null 2>/dev/null)"
+
+# A release that cannot be written is the runaway case: blocked=1 survives, so
+# every following turn end would resume again, one turn a minute, forever.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) - 10 ))"
+chmod 500 "$KEEPER_HOME"
+out=$(bash "$KEEPER" stop </dev/null 2>/dev/null)
+chmod 700 "$KEEPER_HOME"
+assert_eq "a release that will not persist does not resume" "" "$out"
+
+# The pause is recorded once for the account, not per session, so without an
+# exclusive hold every open window would freeze and then be force-resumed — N
+# turns spending the fresh window Keeper had just protected.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) + 60 ))"
+bash "$KEEPER" stop </dev/null >/dev/null 2>&1 &
+holder=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do [ -d "$KEEPER_HOME/.keeper-hold" ] && break; sleep 0.3; done
+s=$(date +%s)
+out=$(bash "$KEEPER" stop </dev/null 2>/dev/null)
+el=$(( $(date +%s) - s ))
+assert_eq "a second session is not held too" "" "$out"
+if [ "$el" -lt 5 ]; then ok "and it is let go at once (${el}s)"
+else bad "and it is let go at once" "<5s" "${el}s"; fi
+kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
+
+# A holder that died must not lock the feature out forever.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) - 10 ))"
+mkdir -p "$KEEPER_HOME/.keeper-hold"
+printf '999999' > "$KEEPER_HOME/.keeper-hold/pid"
+assert_contains "a dead holder is taken over" '"decision":"block"' \
+  "$(bash "$KEEPER" stop </dev/null 2>/dev/null)"
+assert_eq "and the hold is released afterwards" "absent" \
+  "$([ -d "$KEEPER_HOME/.keeper-hold" ] && echo present || echo absent)"
+
+# The state is re-read on every wake, which is what lets a pause lifted from
+# another terminal end the wait early instead of holding to the original reset.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) + 120 ))"
+( sleep 1; bash "$KEEPER" off >/dev/null 2>&1; set_field blocked 1 ) &
+lifter=$!
+s=$(date +%s)
+out=$(bash "$KEEPER" stop </dev/null 2>/dev/null)
+el=$(( $(date +%s) - s ))
+wait "$lifter" 2>/dev/null
+if [ "$el" -lt 35 ]; then ok "the wait notices the guard going off (${el}s)"
+else bad "the wait notices the guard going off" "<35s" "${el}s"; fi
+assert_eq "and switching it off never resumes a turn" "" "$out"
+
+# A planted symlink must not be able to stamp an arbitrary file, nor to disable
+# the resume by making it look like one just fired.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) - 10 ))"
+ln -s "$KEEPER_HOME/victim" "$KEEPER_HOME/.keeper-resumed"
+assert_eq "a symlinked resume marker is refused" "" \
+  "$(bash "$KEEPER" stop </dev/null 2>/dev/null)"
+assert_eq "and nothing is written through it" "absent" \
+  "$([ -f "$KEEPER_HOME/victim" ] && echo present || echo absent)"
+
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+bash "$KEEPER" off >/dev/null 2>&1
+# `off` clears the flag as well, so restoring it is what makes this assertion
+# about the enabled check rather than about the flag.
+set_field blocked 1
+set_field reset_epoch "$(( $(date +%s) + 600 ))"
+assert_eq "a disabled Keeper holds nothing open" "" "$(bash "$KEEPER" stop </dev/null 2>/dev/null)"
+
+# The deny text is the only thing the model reads at the moment it stops, so it
+# has to say the resume is automatic — otherwise it hands the job back to a human.
+new_home
+probe_with 96 "$(clause_in 2)"
+assert_contains "the denial promises the automatic resume" "resume" \
+  "$(bash "$KEEPER" check 2>/dev/null)"
+
 # --- misc --------------------------------------------------------------------
 echo "misc:"
 new_home

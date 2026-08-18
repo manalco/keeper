@@ -48,6 +48,7 @@ PROBE_ERR="$KEEPER_HOME/.keeper-probe-error"
 PROBE_ATTEMPT="$KEEPER_HOME/.keeper-probe-attempt"
 PROBE_CWD="$KEEPER_HOME/.keeper-probe"
 RESUMED="$KEEPER_HOME/.keeper-resumed"
+HOLD="$KEEPER_HOME/.keeper-hold"
 DEFAULT_THRESHOLD=95
 WINDOW_SECONDS=18000
 
@@ -464,22 +465,34 @@ do_stop() {
   [ "${S_est:-0}" = "1" ] && exit 0
 
   # A Stop hook that continues its own continuation loops forever and burns the
-  # window it exists to protect, so three independent things prevent it: the
-  # harness's own marker, the fact that a resume clears the pause before it
-  # answers, and a refusal to resume twice inside a minute.
+  # window it exists to protect. Two things prevent it, both on this side: the
+  # pause is lifted and read back from disk before the answer is written, so the
+  # next stop finds nothing to hold, and a resume that fired in the last minute
+  # refuses to fire again.
   #
-  # The marker is read with the shell's own bounded read. `head` here would block
-  # until the writer closes the pipe, hanging the end of the turn; a fixed-size
-  # prefix scan would miss the marker in a large payload. Whitespace is stripped
-  # and the key matched to its value, because "true" also occurs in the assistant
-  # message the payload carries — matching it loosely silently killed the resume.
-  if [ ! -t 0 ]; then
-    local payload=""
-    IFS= read -r -t 2 -d '' payload 2>/dev/null
-    payload="${payload//[[:space:]]/}"
-    case "$payload" in *'"stop_hook_active":true'*) exit 0 ;; esac
-  fi
+  # The harness's own `stop_hook_active` marker is deliberately not consulted.
+  # Reading stdin at all lets a pipe that is never written hang the end of the
+  # turn, and the marker stays true for every stop in a chain the hook itself
+  # continued — so honouring it would silently kill the resume the second time a
+  # long session hit the wall, which is exactly the case this exists for.
   [ $(( $(date +%s) - $(mtime "$RESUMED") )) -lt 60 ] && exit 0
+
+  # The pause is recorded once for the account, not once per session, so every
+  # open window sees blocked=1 and would hold its own turn and be force-resumed
+  # at the rollover — N model turns spending the window that was just protected,
+  # in sessions with no interrupted work to continue. One holder at a time: the
+  # first turn to end during the pause. mkdir is the lock, as in the probe.
+  if ! mkdir "$HOLD" 2>/dev/null; then
+    local hpid
+    hpid=$(head -c 16 "$HOLD/pid" 2>/dev/null | tr -cd '0-9')
+    # A holder killed with its session must not lock the feature out forever.
+    [ -n "$hpid" ] && kill -0 "$hpid" 2>/dev/null && exit 0
+    mv "$HOLD" "$HOLD.stale.$$" 2>/dev/null || exit 0
+    rm -rf "$HOLD.stale.$$" 2>/dev/null
+    mkdir "$HOLD" 2>/dev/null || exit 0
+  fi
+  printf '%s' "$$" > "$HOLD/pid" 2>/dev/null
+  trap 'rm -rf "$HOLD" 2>/dev/null' EXIT
 
   # Sleep in short spans instead of one long one, re-reading state each time, so
   # a pause lifted from another terminal (`threshold 99`, `off`) is noticed and
@@ -515,8 +528,10 @@ do_stop() {
   load_state || exit 0
   [ "$S_blocked" = "1" ] && exit 0
   maybe_refresh
-  # The armed timer announces the rollover on its own; a second notification from
-  # here said the same thing twice at every reset.
+  # Releasing disarms the timer that would have announced the rollover, and the
+  # timer may never have been armed at all, so the announcement is made here
+  # rather than left to whichever of the two woke first.
+  notify "Session window reset — resuming the paused work."
   touch "$RESUMED" 2>/dev/null
   # Static text and nothing from disk, so the state file cannot reshape this JSON
   # or slip instructions into the turn it restarts.

@@ -589,17 +589,51 @@ out=$(bash "$KEEPER" stop </dev/null 2>/dev/null)
 chmod 700 "$KEEPER_HOME"
 assert_eq "a release that will not persist does not resume" "" "$out"
 
-# The harness marks a continued stop; reading that marker must be bounded, and
-# must not fire on the word "true" appearing anywhere else in the payload.
+# The pause is recorded once for the account, not per session, so without an
+# exclusive hold every open window would freeze and then be force-resumed — N
+# turns spending the fresh window Keeper had just protected.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) + 60 ))"
+bash "$KEEPER" stop </dev/null >/dev/null 2>&1 &
+holder=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do [ -d "$KEEPER_HOME/.keeper-hold" ] && break; sleep 0.3; done
+s=$(date +%s)
+out=$(bash "$KEEPER" stop </dev/null 2>/dev/null)
+el=$(( $(date +%s) - s ))
+assert_eq "a second session is not held too" "" "$out"
+if [ "$el" -lt 5 ]; then ok "and it is let go at once (${el}s)"
+else bad "and it is let go at once" "<5s" "${el}s"; fi
+kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
+
+# A holder that died must not lock the feature out forever.
 new_home
 probe_with 96 "$(clause_in 2)"
 bash "$KEEPER" check >/dev/null 2>&1
 set_field reset_epoch "$(( $(date +%s) - 10 ))"
-assert_eq "the harness marker is honoured" "" \
-  "$(printf '{"hook_event_name":"Stop","stop_hook_active":true}' | bash "$KEEPER" stop 2>/dev/null)"
-rm -f "$KEEPER_HOME/.keeper-resumed"
-assert_contains "a message merely containing true still resumes" '"decision":"block"' \
-  "$(printf '{"stop_hook_active":false,"last_assistant_message":"that is true"}' | bash "$KEEPER" stop 2>/dev/null)"
+mkdir -p "$KEEPER_HOME/.keeper-hold"
+printf '999999' > "$KEEPER_HOME/.keeper-hold/pid"
+assert_contains "a dead holder is taken over" '"decision":"block"' \
+  "$(bash "$KEEPER" stop </dev/null 2>/dev/null)"
+assert_eq "and the hold is released afterwards" "absent" \
+  "$([ -d "$KEEPER_HOME/.keeper-hold" ] && echo present || echo absent)"
+
+# The state is re-read on every wake, which is what lets a pause lifted from
+# another terminal end the wait early instead of holding to the original reset.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) + 120 ))"
+( sleep 1; bash "$KEEPER" off >/dev/null 2>&1; set_field blocked 1 ) &
+lifter=$!
+s=$(date +%s)
+out=$(bash "$KEEPER" stop </dev/null 2>/dev/null)
+el=$(( $(date +%s) - s ))
+wait "$lifter" 2>/dev/null
+if [ "$el" -lt 35 ]; then ok "the wait notices the guard going off (${el}s)"
+else bad "the wait notices the guard going off" "<35s" "${el}s"; fi
+assert_eq "and switching it off never resumes a turn" "" "$out"
 
 # A planted symlink must not be able to stamp an arbitrary file, nor to disable
 # the resume by making it look like one just fired.
@@ -617,6 +651,10 @@ new_home
 probe_with 96 "$(clause_in 2)"
 bash "$KEEPER" check >/dev/null 2>&1
 bash "$KEEPER" off >/dev/null 2>&1
+# `off` clears the flag as well, so restoring it is what makes this assertion
+# about the enabled check rather than about the flag.
+set_field blocked 1
+set_field reset_epoch "$(( $(date +%s) + 600 ))"
 assert_eq "a disabled Keeper holds nothing open" "" "$(bash "$KEEPER" stop </dev/null 2>/dev/null)"
 
 # The deny text is the only thing the model reads at the moment it stops, so it

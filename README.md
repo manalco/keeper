@@ -1,7 +1,7 @@
 # Keeper
 
 [![status](https://img.shields.io/badge/status-active-108C4A?style=flat-square)](#)
-[![self--check](https://img.shields.io/badge/self--check-104%2F104%20passing-2E7D32?style=flat-square)](#self-check)
+[![self--check](https://img.shields.io/badge/self--check-108%2F108%20passing-2E7D32?style=flat-square)](#self-check)
 [![token cost](https://img.shields.io/badge/token%20cost-~69%20tokens%2Fsession-1565C0?style=flat-square)](#what-it-costs)
 [![probe](https://img.shields.io/badge/probe-0%20API%20calls-1565C0?style=flat-square)](#how-it-works)
 [![threshold](https://img.shields.io/badge/default%20threshold-95%25-D97706?style=flat-square)](#configuration)
@@ -105,8 +105,9 @@ holds that turn open instead of letting the session go idle: a sleeping shell,
 waking every 30s to re-read the state file, spending **nothing** while it waits.
 When the reset arrives it lifts the pause and answers the hook with a `block`
 decision, which is how a `Stop` hook says *keep going* — the same conversation,
-with its full context, carries on where it stopped. The rollover notification
-comes from the armed timer, as it always did; the resume adds no second one.
+with its full context, carries on where it stopped. Releasing disarms the timer
+that would have announced the rollover — and that timer may never have been armed
+— so the resume makes the announcement itself.
 
 Four properties matter more than the mechanism:
 
@@ -119,13 +120,23 @@ Four properties matter more than the mechanism:
   clause it stores a placeholder fifteen minutes out. Waiting that out and then
   resuming would send the model back to work with the window still full, so a
   reading marked `~` holds nothing open.
-- **It never loops.** Three separate things prevent it: the harness marks a stop
-  it already continued and Keeper honours that marker, the pause is lifted before
-  the answer is written so the next stop finds nothing to hold, and a resume that
-  fired in the last minute refuses to fire again. The release is also read back
-  from disk first — a release that failed to persist leaves `blocked=1` behind,
-  and answering anyway would resume a turn every minute for as long as the disk
-  stayed unwritable.
+- **One session is held, not all of them.** The pause is recorded once for the
+  account, so every open window sees it. Without an exclusive hold each would
+  freeze its own turn and be force-resumed at the rollover — N model turns
+  spending the window that was just protected, in sessions with no interrupted
+  work to continue. The first turn to end during the pause takes an `mkdir` lock;
+  the rest are let go immediately, and a holder that dies with its session is
+  taken over rather than locking the feature out.
+- **It never loops.** The pause is lifted *and read back from disk* before the
+  answer is written, so the next stop finds nothing to hold; a release that
+  failed to persist leaves `blocked=1` behind, and answering anyway would resume
+  a turn every minute for as long as the disk stayed unwritable. A resume that
+  fired in the last minute also refuses to fire again. Keeper does not consult
+  the harness's `stop_hook_active` marker: reading stdin at all lets an unwritten
+  pipe hang the end of a turn, and the marker stays true for every stop in a
+  chain the hook itself continued — honouring it would silently kill the resume
+  the *second* time a long session hit the wall, which is the case this exists
+  for.
 - **A pause lifted by hand is noticed.** Raising the threshold from another
   terminal releases the state file, and the sleeper picks that up on its next
   30s wake rather than sitting until the original reset.
@@ -177,7 +188,7 @@ Files:
 |---|---|
 | `~/.claude/skills/keeper/hooks/keeper.sh` | probe, gate, session block, the held-open turn, config |
 | `~/.claude/skills/keeper/hooks/keeper-statusline.sh` | `[KEEPER:NN%]` badge |
-| `~/.claude/skills/keeper/hooks/keeper-selfcheck.sh` | 104 offline assertions |
+| `~/.claude/skills/keeper/hooks/keeper-selfcheck.sh` | 108 offline assertions |
 | `~/.claude/skills/keeper/SKILL.md` | the control-surface skill |
 | `~/.claude/.keeper-state` | cached reading (`pct`, `reset_epoch`, `blocked`) |
 | `~/.claude/.keeper-config` | `threshold=95`, `enabled=1` |
@@ -215,7 +226,7 @@ Keeper's own 18300s cap on the wait:
 bash ~/.claude/skills/keeper/hooks/keeper-selfcheck.sh
 ```
 
-104 assertions, fully offline against a fixture in a throwaway `KEEPER_HOME`, so
+108 assertions, fully offline against a fixture in a throwaway `KEEPER_HOME`, so
 it needs no network and never touches real state. Covers percentage parsing,
 timezone-aware reset math, the dateless `resets 3:50pm` variant, inclusive
 threshold, auto-release, the held-open turn and its loop guard, percentage

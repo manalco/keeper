@@ -47,7 +47,7 @@ bash ~/.claude/skills/keeper/hooks/keeper.sh probe         # force a fresh readi
 bash ~/.claude/skills/keeper/hooks/keeper.sh threshold 90  # change the pause point (1-100)
 bash ~/.claude/skills/keeper/hooks/keeper.sh off           # stop guarding
 bash ~/.claude/skills/keeper/hooks/keeper.sh on            # resume guarding
-bash ~/.claude/skills/keeper/hooks/keeper-selfcheck.sh     # 104 offline assertions, no tokens
+bash ~/.claude/skills/keeper/hooks/keeper-selfcheck.sh     # 108 offline assertions, no tokens
 ```
 
 `status` also prints `Gate last consulted: Ns ago`. If that line ever reads

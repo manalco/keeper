@@ -1,7 +1,7 @@
 # Keeper
 
 [![status](https://img.shields.io/badge/status-active-108C4A?style=flat-square)](#)
-[![self--check](https://img.shields.io/badge/self--check-96%2F96%20passing-2E7D32?style=flat-square)](#self-check)
+[![self--check](https://img.shields.io/badge/self--check-104%2F104%20passing-2E7D32?style=flat-square)](#self-check)
 [![token cost](https://img.shields.io/badge/token%20cost-~69%20tokens%2Fsession-1565C0?style=flat-square)](#what-it-costs)
 [![probe](https://img.shields.io/badge/probe-0%20API%20calls-1565C0?style=flat-square)](#how-it-works)
 [![threshold](https://img.shields.io/badge/default%20threshold-95%25-D97706?style=flat-square)](#configuration)
@@ -105,20 +105,27 @@ holds that turn open instead of letting the session go idle: a sleeping shell,
 waking every 30s to re-read the state file, spending **nothing** while it waits.
 When the reset arrives it lifts the pause and answers the hook with a `block`
 decision, which is how a `Stop` hook says *keep going* — the same conversation,
-with its full context, carries on where it stopped.
+with its full context, carries on where it stopped. The rollover notification
+comes from the armed timer, as it always did; the resume adds no second one.
 
-Three properties matter more than the mechanism:
+Four properties matter more than the mechanism:
 
-- **It never loops.** Lifting the pause is the first thing
-  the resume, so the stop that follows finds no pause to hold — and a resume that
-  fired in the last minute refuses to fire again even if the state file claims
-  otherwise. Keeper deliberately ignores the harness's `stop_hook_active` marker
-  on stdin: reading stdin at all lets a pipe that is never written hang the turn
-  end, and a fixed-size prefix scan misses the marker in a large payload. Neither
-  guard here depends on input.
-- **It never waits on a time that will not arrive.** A missing or corrupt reset
-  epoch resumes immediately, the same fail-open rule the gate follows. The wait
-  is also capped at one window plus five minutes.
+- **Only a real rollover restarts a turn.** The wait also ends if the state file
+  disappears, if the guard is switched off from another terminal, if the cap is
+  reached, or if the reset time is unreadable — and every one of those ends the
+  turn silently instead of putting the model back to work. "I stopped waiting" is
+  not "the window reset".
+- **An estimated reset never resumes.** When the probe cannot parse the reset
+  clause it stores a placeholder fifteen minutes out. Waiting that out and then
+  resuming would send the model back to work with the window still full, so a
+  reading marked `~` holds nothing open.
+- **It never loops.** Three separate things prevent it: the harness marks a stop
+  it already continued and Keeper honours that marker, the pause is lifted before
+  the answer is written so the next stop finds nothing to hold, and a resume that
+  fired in the last minute refuses to fire again. The release is also read back
+  from disk first — a release that failed to persist leaves `blocked=1` behind,
+  and answering anyway would resume a turn every minute for as long as the disk
+  stayed unwritable.
 - **A pause lifted by hand is noticed.** Raising the threshold from another
   terminal releases the state file, and the sleeper picks that up on its next
   30s wake rather than sitting until the original reset.
@@ -130,7 +137,9 @@ minutes above that cap, because a timeout equal to the cap kills the hook at the
 same instant it would have answered. If a harness caps that lower, the hook
 is killed, the turn ends, and Keeper degrades to exactly the old behaviour: the
 pause still releases itself, the desktop notification still fires, and the work
-waits for you to type. Nothing is lost either way; the resume is what you lose.
+waits for you to type. Nothing is lost either way; the resume is what you lose. The same is true of a
+reset time Keeper could not read: it guards, it pauses, it releases — it just
+will not restart the turn on a number it had to guess.
 
 ## What it costs
 
@@ -168,7 +177,7 @@ Files:
 |---|---|
 | `~/.claude/skills/keeper/hooks/keeper.sh` | probe, gate, session block, the held-open turn, config |
 | `~/.claude/skills/keeper/hooks/keeper-statusline.sh` | `[KEEPER:NN%]` badge |
-| `~/.claude/skills/keeper/hooks/keeper-selfcheck.sh` | 96 offline assertions |
+| `~/.claude/skills/keeper/hooks/keeper-selfcheck.sh` | 104 offline assertions |
 | `~/.claude/skills/keeper/SKILL.md` | the control-surface skill |
 | `~/.claude/.keeper-state` | cached reading (`pct`, `reset_epoch`, `blocked`) |
 | `~/.claude/.keeper-config` | `threshold=95`, `enabled=1` |
@@ -206,7 +215,7 @@ Keeper's own 18300s cap on the wait:
 bash ~/.claude/skills/keeper/hooks/keeper-selfcheck.sh
 ```
 
-96 assertions, fully offline against a fixture in a throwaway `KEEPER_HOME`, so
+104 assertions, fully offline against a fixture in a throwaway `KEEPER_HOME`, so
 it needs no network and never touches real state. Covers percentage parsing,
 timezone-aware reset math, the dateless `resets 3:50pm` variant, inclusive
 threshold, auto-release, the held-open turn and its loop guard, percentage
@@ -242,7 +251,8 @@ boundary is what the measures below have in common.
   write, overwrite any file the user owns, and leave the state file itself a
   symlink — which the refusal below would then turn into a permanent silent
   bypass.
-- **Symlinks at the state, config, heartbeat, and timer paths are refused**, and
+- **Symlinks at the state, config, heartbeat, timer, and resume-marker paths are
+  refused**, and
   the refusal is reported by `status`, the badge, and the session block. Refusing
   silently disabled the guard *and* muted the only tool for noticing.
 - **The percentage is clamped on read.** All-digit garbage passes a numeric

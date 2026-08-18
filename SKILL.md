@@ -26,7 +26,9 @@ running. This skill is the control surface: reading state and changing settings.
 - `Stop` holds the interrupted turn open across the rollover and then answers
   `block`, which restarts the same turn with its context intact — so the work
   resumes on its own instead of waiting for the user to type. Waiting is a
-  sleeping shell and costs nothing.
+  sleeping shell and costs nothing. Only a real rollover restarts the turn: an
+  estimated reset time, a guard switched off mid-wait, or an unreadable state
+  file all end the turn quietly instead.
 - The statusline badge shows `[KEEPER:33%]`, coloured against the configured
   threshold, and `[KEEPER:96% BLOCKED 2h14m]` while paused. Suffixes are graded:
   `~` means the percentage is exact but the reset time is estimated, `?` means the
@@ -45,7 +47,7 @@ bash ~/.claude/skills/keeper/hooks/keeper.sh probe         # force a fresh readi
 bash ~/.claude/skills/keeper/hooks/keeper.sh threshold 90  # change the pause point (1-100)
 bash ~/.claude/skills/keeper/hooks/keeper.sh off           # stop guarding
 bash ~/.claude/skills/keeper/hooks/keeper.sh on            # resume guarding
-bash ~/.claude/skills/keeper/hooks/keeper-selfcheck.sh     # 96 offline assertions, no tokens
+bash ~/.claude/skills/keeper/hooks/keeper-selfcheck.sh     # 104 offline assertions, no tokens
 ```
 
 `status` also prints `Gate last consulted: Ns ago`. If that line ever reads

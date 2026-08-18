@@ -546,14 +546,72 @@ if [ "$el" -ge 1 ] && [ "$el" -lt 30 ]; then ok "the turn is held open until the
 else bad "the turn is held open until the reset" "1-29s" "${el}s"; fi
 assert_contains "and then continues" '"decision":"block"' "$out"
 
-# A corrupt reset time must resume immediately, never wait on a time that will
-# not arrive — the same fail-open rule the gate follows.
+# Only a real rollover may restart a turn. A corrupt reset time is not one: it
+# must neither wait on a moment that will not arrive nor drive the model back to
+# work on a window that may still be full. It ends the turn, and the gate's own
+# fail-open path releases the pause on the next tool call.
 new_home
 probe_with 96 "$(clause_in 2)"
 bash "$KEEPER" check >/dev/null 2>&1
 set_field reset_epoch 0
+s=$(date +%s)
+assert_eq "a corrupt reset ends the turn instead of resuming it" "" \
+  "$(bash "$KEEPER" stop </dev/null 2>/dev/null)"
+if [ $(( $(date +%s) - s )) -lt 5 ]; then ok "and it does not wait on it"
+else bad "and it does not wait on it" "<5s" "$(( $(date +%s) - s ))s"; fi
+
+# An estimated reset is a placeholder 15 minutes out, not a reading. Resuming on
+# it would send the model back to work with the window still at 96%.
+new_home
+probe_with 96 "resets in 12 minutes"
+bash "$KEEPER" check >/dev/null 2>&1
+assert_eq "an estimated reset never restarts a turn" "" \
+  "$(bash "$KEEPER" stop </dev/null 2>/dev/null)"
+
+# Disabling the guard mid-wait, deleting its state, or hitting the cap are all
+# reasons to stop waiting — none of them is a rollover, so none may resume.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) - 10 ))"
+rm -f "$KEEPER_HOME/.keeper-state"
+assert_eq "an unreadable state ends the turn" "" \
+  "$(bash "$KEEPER" stop </dev/null 2>/dev/null)"
+
+# A release that cannot be written is the runaway case: blocked=1 survives, so
+# every following turn end would resume again, one turn a minute, forever.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) - 10 ))"
+chmod 500 "$KEEPER_HOME"
 out=$(bash "$KEEPER" stop </dev/null 2>/dev/null)
-assert_contains "a bogus reset resumes instead of waiting forever" '"decision":"block"' "$out"
+chmod 700 "$KEEPER_HOME"
+assert_eq "a release that will not persist does not resume" "" "$out"
+
+# The harness marks a continued stop; reading that marker must be bounded, and
+# must not fire on the word "true" appearing anywhere else in the payload.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) - 10 ))"
+assert_eq "the harness marker is honoured" "" \
+  "$(printf '{"hook_event_name":"Stop","stop_hook_active":true}' | bash "$KEEPER" stop 2>/dev/null)"
+rm -f "$KEEPER_HOME/.keeper-resumed"
+assert_contains "a message merely containing true still resumes" '"decision":"block"' \
+  "$(printf '{"stop_hook_active":false,"last_assistant_message":"that is true"}' | bash "$KEEPER" stop 2>/dev/null)"
+
+# A planted symlink must not be able to stamp an arbitrary file, nor to disable
+# the resume by making it look like one just fired.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) - 10 ))"
+ln -s "$KEEPER_HOME/victim" "$KEEPER_HOME/.keeper-resumed"
+assert_eq "a symlinked resume marker is refused" "" \
+  "$(bash "$KEEPER" stop </dev/null 2>/dev/null)"
+assert_eq "and nothing is written through it" "absent" \
+  "$([ -f "$KEEPER_HOME/victim" ] && echo present || echo absent)"
 
 new_home
 probe_with 96 "$(clause_in 2)"

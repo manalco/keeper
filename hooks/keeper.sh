@@ -58,7 +58,7 @@ mkdir -p "$KEEPER_HOME" 2>/dev/null
 # them is right, but refusing *silently* left the operator with no diagnostic,
 # so the refusal is recorded and every human-facing subcommand reports it.
 REFUSED=""
-for f in "$STATE" "$CONFIG" "$LASTCHECK" "$TIMER"; do
+for f in "$STATE" "$CONFIG" "$LASTCHECK" "$TIMER" "$RESUMED"; do
   if [ -L "$f" ]; then REFUSED="$f"; break; fi
 done
 
@@ -458,22 +458,33 @@ do_stop() {
   # Only a turn that actually hit the pause is held; any other stop is none of
   # Keeper's business and must cost nothing.
   [ "$S_blocked" = "1" ] || exit 0
+  # An estimated reset is a 15-minute placeholder, not a reading. Waiting it out
+  # and then sending the model back to work would restart the job with the window
+  # possibly still full — the one outcome worse than stopping too early.
+  [ "${S_est:-0}" = "1" ] && exit 0
+
   # A Stop hook that continues its own continuation loops forever and burns the
-  # window it exists to protect, so two independent things prevent it. First, a
-  # resume clears the pause before it answers, so the next stop finds nothing to
-  # hold. Second, this: a resume that fired moments ago refuses to fire again,
-  # which holds even if the state file is lying about the pause.
+  # window it exists to protect, so three independent things prevent it: the
+  # harness's own marker, the fact that a resume clears the pause before it
+  # answers, and a refusal to resume twice inside a minute.
   #
-  # The harness also marks a continued stop with `stop_hook_active` on stdin, but
-  # reading it is not worth the exposure — an unwritten pipe would hang the turn
-  # end for as long as the harness allows, and a fixed-size prefix scan misses the
-  # marker in a large payload anyway. Neither guard below depends on input.
+  # The marker is read with the shell's own bounded read. `head` here would block
+  # until the writer closes the pipe, hanging the end of the turn; a fixed-size
+  # prefix scan would miss the marker in a large payload. Whitespace is stripped
+  # and the key matched to its value, because "true" also occurs in the assistant
+  # message the payload carries — matching it loosely silently killed the resume.
+  if [ ! -t 0 ]; then
+    local payload=""
+    IFS= read -r -t 2 -d '' payload 2>/dev/null
+    payload="${payload//[[:space:]]/}"
+    case "$payload" in *'"stop_hook_active":true'*) exit 0 ;; esac
+  fi
   [ $(( $(date +%s) - $(mtime "$RESUMED") )) -lt 60 ] && exit 0
 
   # Sleep in short spans instead of one long one, re-reading state each time, so
   # a pause lifted from another terminal (`threshold 99`, `off`) is noticed and
-  # the work resumes at once rather than at the original reset time.
-  local now deadline left
+  # the turn ends rather than sitting until the original reset time.
+  local now deadline left rollover=0
   now=$(date +%s)
   deadline=$(( now + WINDOW_SECONDS + 300 ))
   while :; do
@@ -482,21 +493,30 @@ do_stop() {
     [ "$(enabled)" = "1" ] || break
     now=$(date +%s)
     [ "$now" -ge "$deadline" ] && break
-    # A corrupt or missing reset time resumes immediately. Waiting on a moment
-    # that will never arrive is the one failure this hook cannot recover from,
-    # since the turn it is holding is the only thing left running.
+    # A corrupt or missing reset time is not a rollover and never becomes one, so
+    # the wait ends here rather than hanging on a moment that will not arrive.
+    # Releasing the pause is left to the gate, which does it on the next call.
     [ -n "$S_reset" ] && [ "$S_reset" -gt 0 ] || break
     left=$(( S_reset - now ))
-    [ "$left" -le 0 ] && break
+    if [ "$left" -le 0 ]; then rollover=1; break; fi
     [ "$left" -gt 30 ] && left=30
     sleep "$left"
   done
 
-  if [ "${S_blocked:-0}" = "1" ]; then
-    release
-    notify "Session window reset — resuming the paused work."
-    maybe_refresh
-  fi
+  # Every other way out of that loop — state gone, guard switched off, cap
+  # reached, reset unreadable — ends the turn silently. Only the window actually
+  # rolling over may put the model back to work.
+  [ "$rollover" = "1" ] || exit 0
+
+  release
+  # A release that did not reach disk leaves blocked=1 behind, and then every
+  # following turn end would resume again, one turn a minute, for as long as the
+  # disk stays unwritable. Confirm the pause is really gone before answering.
+  load_state || exit 0
+  [ "$S_blocked" = "1" ] && exit 0
+  maybe_refresh
+  # The armed timer announces the rollover on its own; a second notification from
+  # here said the same thing twice at every reset.
   touch "$RESUMED" 2>/dev/null
   # Static text and nothing from disk, so the state file cannot reshape this JSON
   # or slip instructions into the turn it restarts.

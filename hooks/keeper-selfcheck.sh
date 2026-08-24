@@ -735,6 +735,121 @@ probe_with 96 "$(clause_in 2)"
 assert_contains "the denial promises the automatic resume" "resume" \
   "$(bash "$KEEPER" check 2>/dev/null)"
 
+# --- interrupted work --------------------------------------------------------
+echo "interrupted work:"
+# The pause is only half of the promise; the other half is that the work starts
+# again by itself. The hold covers the ordinary case — the turn ends while the
+# pause is still on, so there is a turn to hold. When the pause lifts first, from
+# another session or another terminal, `blocked` is already 0 when the turn ends,
+# nothing is held, and nothing re-invokes the model: the job sits there waiting
+# for a human to type. The gate records every denial so that case is recoverable.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+assert_eq "a denial records the interrupted work" "1" \
+  "$([ -f "$KEEPER_HOME/.keeper-pending" ] && echo 1 || echo 0)"
+
+bash "$KEEPER" threshold 99 >/dev/null 2>&1
+s=$(date +%s)
+out=$(bash "$KEEPER" stop </dev/null 2>/dev/null)
+el=$(( $(date +%s) - s ))
+assert_contains "a pause lifted with no turn to hold still resumes" '"decision":"block"' "$out"
+if [ "$el" -lt 5 ]; then ok "and it does not wait first (${el}s)"
+else bad "and it does not wait first" "<5s" "${el}s"; fi
+assert_eq "the record is spent by the restart" "0" \
+  "$([ -f "$KEEPER_HOME/.keeper-pending" ] && echo 1 || echo 0)"
+
+# Restarting the same work twice is worse than not restarting it: the second one
+# has no interrupted turn behind it and talks to a user who never asked.
+assert_eq "and it never fires twice" "" "$(bash "$KEEPER" stop </dev/null 2>/dev/null)"
+
+# Work that carried on needs no restarting, and the tool call that carried it is
+# the proof. Without this the record would outlive the interruption and restart a
+# session that had long since moved on.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+bash "$KEEPER" threshold 99 >/dev/null 2>&1
+bash "$KEEPER" check >/dev/null 2>&1
+assert_eq "an allowed tool call clears the record" "0" \
+  "$([ -f "$KEEPER_HOME/.keeper-pending" ] && echo 1 || echo 0)"
+assert_eq "and nothing is restarted" "" "$(bash "$KEEPER" stop </dev/null 2>/dev/null)"
+
+# The record is one file for the whole account, so it says a denial happened, not
+# which turn it happened to. Age is the only thing tying it back: the denied turn
+# ends moments later. A turn ending long afterwards belongs to some other session
+# going about its business, and restarting that one hands a user work they never
+# interrupted.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+bash "$KEEPER" threshold 99 >/dev/null 2>&1
+touch -t 202001010101 "$KEEPER_HOME/.keeper-pending" 2>/dev/null
+assert_eq "a stale record restarts nothing" "" "$(bash "$KEEPER" stop </dev/null 2>/dev/null)"
+
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+bash "$KEEPER" threshold 99 >/dev/null 2>&1
+python3 - "$KEEPER_HOME/.keeper-pending" <<'PY2'
+import os, sys, time
+p = sys.argv[1]
+old = time.time() - 300
+os.utime(p, (old, old))
+PY2
+assert_eq "a record from an unrelated turn restarts nothing" "" \
+  "$(bash "$KEEPER" stop </dev/null 2>/dev/null)"
+
+# Every session parked behind one pause ends its turn the moment it lifts, and
+# each would find the same record. Restarting all of them spends the window that
+# was just protected, so the restart takes the same lock the wait does.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+bash "$KEEPER" threshold 99 >/dev/null 2>&1
+one=$(bash "$KEEPER" stop </dev/null 2>/dev/null) &
+two=$(bash "$KEEPER" stop </dev/null 2>/dev/null) &
+wait
+count=$(( $(bash "$KEEPER" stop </dev/null 2>/dev/null | grep -c 'decision') ))
+assert_eq "a spent record restarts nothing more" "0" "$count"
+
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+bash "$KEEPER" off >/dev/null 2>&1
+assert_eq "a disabled Keeper restarts nothing" "" "$(bash "$KEEPER" stop </dev/null 2>/dev/null)"
+
+# A planted symlink must not be able to stamp an arbitrary file through the
+# record, the way the state file and the resume marker are already protected.
+new_home
+ln -s "$KEEPER_HOME/victim" "$KEEPER_HOME/.keeper-pending"
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+assert_eq "a symlinked record is refused" "0" \
+  "$([ -f "$KEEPER_HOME/victim" ] && echo 1 || echo 0)"
+
+# --- the denial says what to do ----------------------------------------------
+echo "denial wording:"
+# The denial is the only instruction the model gets, and the resume depends on it
+# ending the turn: a model that keeps talking is a model with no turn to hold, and
+# then nothing restarts the work. Naming the mechanism is what stops it being
+# re-derived — wrongly — by whoever reads the denial next.
+new_home
+probe_with 96 "$(clause_in 2)"
+out=$(bash "$KEEPER" check 2>/dev/null)
+assert_contains "the denial says to end the turn" "End the turn" "$out"
+assert_contains "the denial says the restart is automatic" "restart" "$out"
+assert_contains "the denial says the user need not act" "does not need" "$out"
+assert_eq "the denial is still valid JSON" "ok" \
+  "$(printf '%s' "$out" | python3 -c 'import json,sys; json.load(sys.stdin); print("ok")' 2>/dev/null)"
+
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) + 30 ))"
+assert_contains "a pause under a minute is not reported as 0m" "<1m" \
+  "$(bash "$KEEPER" check 2>/dev/null)"
+
 # --- misc --------------------------------------------------------------------
 echo "misc:"
 new_home

@@ -73,14 +73,23 @@ The denial text starts with `KEEPER`. That is the pause working as designed, not
 bug and not something to route around. Stop on the spot: no retrying the tool, no
 substituting a different tool, no pressing on in prose as if the work continued.
 
-Tell the user plainly that Keeper paused the session, at what percentage, and when
-it releases — and that the work resumes by itself, so nobody has to sit and watch.
-Then end the turn: ending it is what hands control to the `Stop` hook, which holds
-the turn open and restarts it at the rollover. Working around the pause defeats
-the entire point — the budget it is protecting is what finishes the job.
+Say plainly that Keeper paused the session, at what percentage, and for how long
+— and that the work resumes by itself, so nobody has to sit and watch. Prefer the
+duration over a clock time: the reset time is sometimes only an estimate, and the
+duration never is.
 
-When that restart arrives it reads `KEEPER RESUME`. Continue the interrupted work
+Then end the turn. Ending it is what delivers the turn to the `Stop` hook, which
+is the only thing that can restart the work: it holds the turn open across the
+rollover, and it restarts a turn that ended just after the pause lifted. Neither
+can reach a session that keeps talking instead of stopping, and asking the user
+to reply turns an automatic restart into a job waiting on a human. Working around
+the pause defeats the whole point — the budget it protects is what finishes the
+job.
+
+When the restart arrives it reads `KEEPER RESUME`. Continue the interrupted work
 straight away; do not re-open the question with the user or replay what happened.
+If it arrives in a session that had nothing interrupted — the record is per
+account and per project, not per session — say so in one line and stop.
 
 ## Limits worth stating honestly
 
@@ -88,6 +97,8 @@ Keeper gates tools, not text, so it cannot physically stop a reply from being
 written; the denial instructs the stop. The automatic resume needs the `Stop`
 hook to be allowed to run for the length of the wait (`timeout: 18420` in
 settings); if the harness kills it earlier, the pause still releases but the work
-waits for the user's next message. And a subagent already mid-tool-call
+waits for the user's next message. A restart is only ever delivered at the end of
+a turn, so a session whose turn already ended without being held waits too, and
+an estimated reset time restarts nothing at all. And a subagent already mid-tool-call
 finishes that call — the block lands on its next one, which is part of why the
 default threshold leaves 5% of headroom rather than sitting at 99%.

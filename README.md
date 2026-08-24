@@ -1,7 +1,7 @@
 # Keeper
 
 [![status](https://img.shields.io/badge/status-active-108C4A?style=flat-square)](#)
-[![self--check](https://img.shields.io/badge/self--check-108%2F108%20passing-2E7D32?style=flat-square)](#self-check)
+[![self--check](https://img.shields.io/badge/self--check-136%2F136%20passing-2E7D32?style=flat-square)](#self-check)
 [![token cost](https://img.shields.io/badge/token%20cost-~69%20tokens%2Fsession-1565C0?style=flat-square)](#what-it-costs)
 [![probe](https://img.shields.io/badge/probe-0%20API%20calls-1565C0?style=flat-square)](#how-it-works)
 [![threshold](https://img.shields.io/badge/default%20threshold-95%25-D97706?style=flat-square)](#configuration)
@@ -119,7 +119,7 @@ with its full context, carries on where it stopped. Releasing disarms the timer
 that would have announced the rollover — and that timer may never have been armed
 — so the resume makes the announcement itself.
 
-Four properties matter more than the mechanism:
+These properties matter more than the mechanism:
 
 - **Only a real rollover restarts a turn.** The wait also ends if the state file
   disappears, if the guard is switched off from another terminal, if the cap is
@@ -130,6 +130,33 @@ Four properties matter more than the mechanism:
   an early rollover looks like from here, and the wait refreshes the reading
   itself while it sleeps, since a held turn makes no tool calls and nothing else
   would.
+- **A restart does not need a turn to have been held.** Holding covers the
+  ordinary case, where the turn ends while the pause is still on. When the pause
+  lifts first — another session's gate, a raised threshold, a reading that came
+  back under the limit — `blocked` is already `0` when the turn ends, so there is
+  nothing to hold and nothing re-invokes the model: the job stops and waits for a
+  human, having just said it would carry on by itself. The gate records every
+  denial and clears the record as soon as a tool runs again, so a record still
+  standing when a turn ends means the work was interrupted and has not moved.
+  That turn is restarted on the spot, without waiting.
+
+  The record is one file for the whole account, like the pause itself, so three
+  things keep it from answering for work it never interrupted. It carries the
+  project the hooks were called for, and a session in another checkout ignores
+  it. It is only acted on for two minutes, because the gap it exists to cover is
+  between a tool being denied and that same turn ending — the model writing one
+  line and stopping. And it is claimed with `mv`, which either moves the file or
+  does not, so of several sessions ending their turns the moment a pause lifts,
+  exactly one gets the restart. It is written the same `mktemp`-then-`mv` way as
+  the state file, so a link planted in its place is replaced rather than followed,
+  and `keeper.sh off` clears it: switching the guard off ends the pause on
+  purpose, and owes nobody a restart.
+
+  The restart also refuses the state a corrupt reset time leaves behind. That
+  release fabricates `pct=0` to break a deadlock the account may be sitting at
+  99% behind, and it zeroes `fetched_at` precisely so nothing trusts the number.
+  Restarting on it would drive the work into the wall the pause was holding it
+  back from.
 - **An estimated reset never resumes.** When the probe cannot parse the reset
   clause it stores a placeholder fifteen minutes out. Waiting that out and then
   resuming would send the model back to work with the window still full, so a
@@ -154,6 +181,21 @@ Four properties matter more than the mechanism:
 - **A pause lifted by hand is noticed.** Raising the threshold from another
   terminal releases the state file, and the sleeper picks that up on its next
   30s wake rather than sitting until the original reset.
+
+What the restart still does not cover, stated rather than implied:
+
+- **An estimated reset never restarts anything.** A reset clause the parser
+  cannot read stores a placeholder, and a placeholder is not a rollover.
+- **One restart per pause, per account.** Several sessions parked behind one
+  pause end their turns together; one is restarted and the others are not. The
+  alternative is N turns spending the window that was just protected.
+- **Two sessions in one project still share a record.** The hooks never read
+  stdin — a pipe that is never written would hang the end of a turn — and that is
+  where the session id would be. The project narrows it; it does not partition it.
+- **A restart needs a turn to end.** It is delivered by answering the `Stop`
+  hook, so it reaches a session at the moment its turn ends and at no other. A
+  session whose turn already ended without holding cannot be re-invoked by
+  anything Keeper has; that one waits for the user.
 
 Honest limit: this depends on the hook being allowed to run as long as the wait.
 Claude Code kills a hook at its configured `timeout`. Keeper caps its own wait at
@@ -202,7 +244,7 @@ Files:
 |---|---|
 | `~/.claude/skills/keeper/hooks/keeper.sh` | probe, gate, session block, the held-open turn, config |
 | `~/.claude/skills/keeper/hooks/keeper-statusline.sh` | `[KEEPER:NN%]` badge |
-| `~/.claude/skills/keeper/hooks/keeper-selfcheck.sh` | 108 offline assertions |
+| `~/.claude/skills/keeper/hooks/keeper-selfcheck.sh` | 136 offline assertions |
 | `~/.claude/skills/keeper/SKILL.md` | the control-surface skill |
 | `~/.claude/.keeper-state` | cached reading (`pct`, `reset_epoch`, `blocked`) |
 | `~/.claude/.keeper-config` | `threshold=95`, `enabled=1` |
@@ -210,6 +252,9 @@ Files:
 | `~/.claude/.keeper-timer.pid` | the armed rollover sleeper, as `pid epoch` |
 | `~/.claude/.keeper-probe-error` | why the last reading failed, if it did |
 | `~/.claude/.keeper-probe-attempt` | when it last tried, so failures back off |
+| `~/.claude/.keeper-pending` | work stopped for the pause and has not moved since |
+| `~/.claude/.keeper-resumed` | when the last restart fired, so it cannot fire twice |
+| `~/.claude/.keeper-hold` | the lock held by the one session waiting out the pause |
 
 `status` reports `Gate last consulted: Ns ago`. If it ever says the gate was
 never consulted, the hooks are not loaded and Keeper is watching nothing — that

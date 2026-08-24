@@ -1,7 +1,7 @@
 # Keeper
 
 [![status](https://img.shields.io/badge/status-active-108C4A?style=flat-square)](#)
-[![self--check](https://img.shields.io/badge/self--check-136%2F136%20passing-2E7D32?style=flat-square)](#self-check)
+[![self--check](https://img.shields.io/badge/self--check-147%2F147%20passing-2E7D32?style=flat-square)](#self-check)
 [![token cost](https://img.shields.io/badge/token%20cost-~69%20tokens%2Fsession-1565C0?style=flat-square)](#what-it-costs)
 [![probe](https://img.shields.io/badge/probe-0%20API%20calls-1565C0?style=flat-square)](#how-it-works)
 [![threshold](https://img.shields.io/badge/default%20threshold-95%25-D97706?style=flat-square)](#configuration)
@@ -130,6 +130,21 @@ These properties matter more than the mechanism:
   an early rollover looks like from here, and the wait refreshes the reading
   itself while it sleeps, since a held turn makes no tool calls and nothing else
   would.
+- **The restart reads the window again before it fires.** The rollover happens on
+  the account's clock, not on this one, and for a short while after it `/usage`
+  still reports the window that just ended — its percentage as much as its label.
+  Answering the instant the recorded reset time came due restarted the work
+  against that old reading: releasing forces a fresh probe, the probe wrote the
+  ending window's percentage straight back, and the next tool call was denied a
+  second after the model had been told to carry on. So the first time a reset
+  time comes due the wait does not answer. It forces a read, waits a minute, and
+  comes round again, by which point the account agrees the window moved and the
+  release keeps that reading. A reading that says the window is genuinely still
+  full carries its own next reset time, and the wait waits for that instead. The
+  grace is granted once per reset time, so a probe that never lands cannot spin
+  there — the second time the same moment comes due, the turn is restarted on the
+  old terms. Running out of time during the grace restarts it too: that restart
+  is already owed, and dropping it to chase a fresher reading loses the work.
 - **A restart does not need a turn to have been held.** Holding covers the
   ordinary case, where the turn ends while the pause is still on. When the pause
   lifts first — another session's gate, a raised threshold, a reading that came
@@ -244,7 +259,7 @@ Files:
 |---|---|
 | `~/.claude/skills/keeper/hooks/keeper.sh` | probe, gate, session block, the held-open turn, config |
 | `~/.claude/skills/keeper/hooks/keeper-statusline.sh` | `[KEEPER:NN%]` badge |
-| `~/.claude/skills/keeper/hooks/keeper-selfcheck.sh` | 136 offline assertions |
+| `~/.claude/skills/keeper/hooks/keeper-selfcheck.sh` | 147 offline assertions |
 | `~/.claude/skills/keeper/SKILL.md` | the control-surface skill |
 | `~/.claude/.keeper-state` | cached reading (`pct`, `reset_epoch`, `blocked`) |
 | `~/.claude/.keeper-config` | `threshold=95`, `enabled=1` |

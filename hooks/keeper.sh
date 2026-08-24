@@ -560,7 +560,16 @@ do_check() {
     # Releasing on a bogus epoch too. Requiring epoch > 0 made a zero or missing
     # value an unbreakable pause: every tool denied forever, including the one
     # that would lift it, so the only way out was an external terminal.
-    if [ -z "$S_reset" ] || [ "$S_reset" -le 0 ] || [ "$left" -le 0 ]; then
+    # The reset time is a prediction; the percentage is a reading. A pause held
+    # against a fresh reading below the threshold is the guard arguing with its
+    # own probe — which is what a rollover that lands earlier than the recorded
+    # reset time looks like from here: pct back at 0, reset_epoch still hours
+    # out, every tool denied with "at 0% (limit 95%)" until that hour passes.
+    # A percentage only falls back under the threshold when the window turned
+    # over, so letting go on it costs no protection and closes the one pause
+    # that could not be lifted from inside the session.
+    if [ -z "$S_reset" ] || [ "$S_reset" -le 0 ] || [ "$left" -le 0 ] \
+       || { [ -n "$S_pct" ] && [ "$S_pct" -lt "$th" ]; }; then
       release
       notify "Session window reset — Keeper released the pause."
       maybe_refresh

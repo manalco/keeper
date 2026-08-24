@@ -199,6 +199,30 @@ assert_eq "block marker cleared" "0" "$(state blocked)"
 assert_eq "release disarms the timer" "absent" \
   "$([ -f "$KEEPER_HOME/.keeper-timer.pid" ] && echo present || echo absent)"
 
+# The clock is not the only thing that ends a pause. When the window rolls over
+# the probe reads a fresh low percentage while the recorded reset time is still
+# in the future, so a release gated only on that time keeps denying every tool
+# against a reading that says there is nothing left to protect. The percentage
+# the guard trips on is the percentage it has to let go on.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+probe_with 0 "$(clause_in 2)"
+out=$(bash "$KEEPER" check 2>/dev/null)
+assert_not_contains "a fresh reading under threshold stops denying" "deny" "$out"
+assert_eq "block marker cleared by the fresh reading" "0" "$(state blocked)"
+assert_eq "releasing on the reading disarms the timer" "absent" \
+  "$([ -f "$KEEPER_HOME/.keeper-timer.pid" ] && echo present || echo absent)"
+
+# A reading that is still at or above the threshold must keep the pause, or the
+# release turns into a bypass: the one case the guard exists for.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+probe_with 97 "$(clause_in 2)"
+assert_contains "a reading still over threshold keeps denying" "deny" \
+  "$(bash "$KEEPER" check 2>/dev/null)"
+
 # --- config ------------------------------------------------------------------
 echo "config:"
 new_home

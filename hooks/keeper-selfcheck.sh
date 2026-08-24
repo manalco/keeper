@@ -504,6 +504,33 @@ assert_contains "estimated reset shows a tilde" "44%~" "$badge"
 assert_not_contains "estimated reset is not flagged as failure" ":!" "$badge"
 assert_contains "status marks the reset as estimated" "estimated" "$(bash "$KEEPER" status 2>&1)"
 
+# A reset time that could not be read used to become a fifteen-minute placeholder,
+# and everything downstream then treated that invention as a fact: the denial
+# counted down from it, so a pause whose window had almost two hours left
+# announced fourteen minutes; and the gate released on it, handing the tools back
+# with the account still over the limit. A guess may bound the wait. It may not
+# be reported as a measurement, and it may not end a pause.
+new_home
+probe_with 96 "resets in 12 minutes"
+gap=$(( $(state reset_epoch) - $(state fetched_at) ))
+if [ "$gap" -ge 17000 ]; then ok "an unreadable reset does not become a short pause (${gap}s)"
+else bad "an unreadable reset does not become a short pause" ">=17000s" "${gap}s"; fi
+
+out=$(bash "$KEEPER" check 2>/dev/null)
+assert_contains "and the denial says the reset time was not read" "could not be read" "$out"
+assert_not_contains "and gives no countdown from a guess" "blocked for" "$out"
+assert_eq "and the denial is still valid JSON" "ok" \
+  "$(printf '%s' "$out" | python3 -c 'import json,sys; json.load(sys.stdin); print("ok")' 2>/dev/null)"
+
+# What ends an estimated pause is the reading, since that is the part of the
+# probe that was never a guess.
+new_home
+probe_with 96 "resets in 12 minutes"
+assert_contains "an estimated pause still denies" "deny" "$(bash "$KEEPER" check 2>/dev/null)"
+probe_with 4 "resets in 12 minutes"
+assert_not_contains "and lifts when the reading clears" "deny" "$(bash "$KEEPER" check 2>/dev/null)"
+assert_eq "and the pause is marked lifted" "0" "$(state blocked)"
+
 # The failure badge is reserved for having no usable reading at all.
 new_home
 KEEPER_PROBE_FIXTURE=/nonexistent-fixture bash "$KEEPER" probe >/dev/null 2>&1
@@ -761,12 +788,14 @@ assert_eq "a corrupt reset ends the turn instead of resuming it" "" \
 if [ $(( $(date +%s) - s )) -lt 5 ]; then ok "and it does not wait on it"
 else bad "and it does not wait on it" "<5s" "$(( $(date +%s) - s ))s"; fi
 
-# An estimated reset is a placeholder 15 minutes out, not a reading. Resuming on
-# it would send the model back to work with the window still at 96%.
+# An estimated reset is a guess, not a reading. Restarting when that guess comes
+# due would send the model back to work with the window still at 96%, so the
+# clock coming round is not enough on its own.
 new_home
 probe_with 96 "resets in 12 minutes"
 bash "$KEEPER" check >/dev/null 2>&1
-assert_eq "an estimated reset never restarts a turn" "" \
+set_field reset_epoch "$(( $(date +%s) - 10 ))"
+assert_eq "an estimated reset never restarts a turn on its own clock" "" \
   "$(bash "$KEEPER" stop </dev/null 2>/dev/null)"
 
 # Disabling the guard mid-wait, deleting its state, or hitting the cap are all
@@ -776,6 +805,23 @@ probe_with 96 "$(clause_in 2)"
 bash "$KEEPER" check >/dev/null 2>&1
 set_field reset_epoch "$(( $(date +%s) - 10 ))"
 rm -f "$KEEPER_HOME/.keeper-state"
+# But the turn is still held, and the reading is what ends the wait. Refusing to
+# hold at all left an estimated pause with no way back: the gate would not lift it
+# on a clock it did not trust, and no turn was open to restart when it finally
+# lifted on a reading. The job simply stopped.
+new_home
+probe_with 96 "resets in 12 minutes"
+bash "$KEEPER" check >/dev/null 2>&1
+( sleep 2; probe_with 4 "resets in 12 minutes" ) &
+clearer=$!
+s=$(date +%s)
+out=$(bash "$KEEPER" stop </dev/null 2>/dev/null)
+el=$(( $(date +%s) - s ))
+wait "$clearer" 2>/dev/null
+if [ "$el" -lt 45 ]; then ok "an estimated pause restarts the turn once the reading clears (${el}s)"
+else bad "an estimated pause restarts the turn once the reading clears" "<45s" "${el}s"; fi
+assert_contains "and it says so" '"decision":"block"' "$out"
+
 assert_eq "an unreadable state ends the turn" "" \
   "$(bash "$KEEPER" stop </dev/null 2>/dev/null)"
 

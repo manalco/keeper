@@ -21,6 +21,12 @@ running. This skill is the control surface: reading state and changing settings.
   denied and a desktop notification fires.
 - A detached timer sleeps until the reset moment and announces the rollover, so a
   paused session needs nobody watching the clock.
+- The restart waits about a minute past the reset before it fires, and reads the
+  window again first, and the gate keeps the pause through that minute rather
+  than releasing the instant the clock strikes. For a short while after a
+  rollover `/usage` still reports the window that just ended, percentage
+  included, and acting on that reading got the next tool call denied a second
+  later.
 - The pause releases itself once the reset time passes; the cached percentage is
   set to 0 because the window genuinely restarts empty. It also releases as soon
   as a fresh reading lands under the threshold, which is how a window that rolls

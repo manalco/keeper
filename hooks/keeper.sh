@@ -63,6 +63,24 @@ WINDOW_SECONDS=18000
 # instead would let any denial anywhere in the account restart the next turn to
 # end in any session, which is a restart with no interrupted work behind it.
 STRANDED_SECONDS=120
+# How long to wait after the clock says the window turned over, before reading it
+# again and putting the model back to work. The rollover happens on the account's
+# clock, not this one, and for a short while after it `/usage` still reports the
+# window that just ended — its percentage as much as its label. Answering the
+# instant the clock struck therefore restarted the work against the old reading:
+# the probe the release forces wrote the ending window's 96% straight back, and
+# the next tool call was denied on the spot, a second after the model had been
+# told to carry on. A minute is enough for the account to agree that the window
+# moved. The seam is for the self-check, which cannot afford to wait it out.
+RESUME_GRACE="${KEEPER_RESUME_GRACE:-60}"
+RESUME_GRACE_MAX="${KEEPER_RESUME_GRACE_MAX:-300}"
+# Filtered like every other number that arrives from outside. A non-numeric value
+# made sleep fail on the spot, which collapsed the grace to nothing and put the
+# stale-reading bug back without a word — the worst way for a guard to break.
+# Capped because this is the one wait the loop cannot re-examine in the middle of.
+case "$RESUME_GRACE_MAX" in ''|*[!0-9]*) RESUME_GRACE_MAX=300 ;; esac
+case "$RESUME_GRACE" in ''|*[!0-9]*) RESUME_GRACE=60 ;; esac
+[ "$RESUME_GRACE" -gt "$RESUME_GRACE_MAX" ] && RESUME_GRACE="$RESUME_GRACE_MAX"
 
 # The denial is the only instruction the model gets, and everything after the
 # numbers is what decides whether the work restarts. It says end the turn,
@@ -500,7 +518,14 @@ until_phrase() { # "until 3:50pm" when the label is trustworthy, else silence
 # The threshold is read live, not captured at probe time, so a threshold raised
 # from another terminal is honoured here too, and the answer holds even when the
 # probe is dead.
-reading_cleared() { [ -n "$S_pct" ] && [ "$S_pct" -lt "$(threshold)" ]; }
+# The release that breaks a deadlock writes a zero nobody measured, and marks it
+# by zeroing the timestamp beside it. Anything deciding on the percentage has to
+# refuse that one, or the fabrication meant to unstick a corrupt reset time reads
+# as an empty window and lets the work back out against a full one.
+reading_cleared() {
+  [ -n "$S_fetched" ] && [ "$S_fetched" -gt 0 ] &&
+  [ -n "$S_pct" ] && [ "$S_pct" -lt "$(threshold)" ]
+}
 
 # Lifting a pause. Released on the clock, the cached reading belongs to the window
 # that just ended, so it has to go with it or the very next tool call re-blocks;
@@ -632,15 +657,40 @@ do_stop() {
   # Sleep in short spans instead of one long one, re-reading state each time, so
   # a pause lifted from another terminal (`threshold 99`, `off`) is noticed and
   # the turn ends rather than sitting until the original reset time.
-  local now deadline left rollover=0 keep_reading=""
+  local now deadline left rollover=0 keep_reading="" graced="" grace_until=0
   now=$(date +%s)
   deadline=$(( now + WINDOW_SECONDS + 300 ))
   while :; do
     load_state || break
-    [ "$S_blocked" = "1" ] || break
+    # Asked before the pause itself, because a guard switched off mid-wait must
+    # end the turn quietly whatever the state file says next.
     [ "$(enabled)" = "1" ] || break
+    # An estimated reset is a placeholder, and the forced read below happens at
+    # the moment the reset clause is least likely to parse, so this is re-asked
+    # every pass rather than only on the way in.
+    [ "${S_est:-0}" = "1" ] && break
     now=$(date +%s)
-    [ "$now" -ge "$deadline" ] && break
+    if [ "$S_blocked" != "1" ]; then
+      # The pause is one flag for the whole account, so any other session's tool
+      # call can release it on the clock while this turn is parked here. The
+      # pause is gone, but the rollover it came from is this loop's rollover, and
+      # ending quietly strands the work the wait exists to restart. A reset still
+      # ahead means it was lifted by hand instead, which ends the wait and
+      # restarts nothing, as it always has.
+      [ -n "$S_reset" ] && [ "$S_reset" -gt 0 ] && [ "$now" -ge "$S_reset" ] && rollover=1
+      break
+    fi
+    if [ "$now" -ge "$deadline" ]; then
+      # Out of time. Ending silently is right for a turn that never reached its
+      # rollover, but not for one that did and was only waiting out the grace on
+      # this very reset: that restart is already owed, and swallowing it loses
+      # the work for the sake of a reading a minute fresher. Matched against the
+      # current reset, not merely "graced at some point", so a probe that moved
+      # the reset on and then went quiet for a whole window does not come back
+      # here to restart on a reading that never cleared.
+      [ "$graced" = "$S_reset" ] && rollover=1
+      break
+    fi
     # A held turn makes no tool calls, so nothing else refreshes the reading it
     # is waiting on. Without this the only news it could ever receive was a probe
     # some other session happened to run, and a lone paused session slept blind
@@ -657,7 +707,38 @@ do_stop() {
     # Releasing the pause is left to the gate, which does it on the next call.
     [ -n "$S_reset" ] && [ "$S_reset" -gt 0 ] || break
     left=$(( S_reset - now ))
-    if [ "$left" -le 0 ]; then rollover=1; break; fi
+    if [ "$left" -le 0 ]; then
+      # First time this reset time comes due, do not answer on it. Force a read,
+      # wait out the grace, and come round again: by then the account reports the
+      # new window, `reading_cleared` sees it above, and the release keeps that
+      # reading instead of the one belonging to the window that just closed. If
+      # the new reading says the window is genuinely still full, the probe has
+      # also written the next reset time and this loop simply waits for it.
+      #
+      # Only once per reset time, so a probe that never lands cannot spin here:
+      # the second time the same moment comes due, the turn is restarted on the
+      # old terms, which is what it did before this existed.
+      if [ "$graced" != "$S_reset" ]; then
+        graced="$S_reset"
+        grace_until=$(( now + RESUME_GRACE ))
+        # The TTL is what usually holds a refresh back, and a reading taken
+        # before the rollover is exactly the one not to wait on.
+        S_fetched=0
+        maybe_refresh
+      fi
+      # Poll rather than sleep the grace out in one go. The account usually
+      # agrees within a probe or two, and `reading_cleared` above sees that on
+      # the next pass and answers then instead of at the end of the minute; the
+      # short spans also keep the guard, the pause and the deadline live
+      # throughout, which one long sleep did not.
+      if [ "$now" -lt "$grace_until" ]; then
+        left=$(( grace_until - now ))
+        [ "$left" -gt 5 ] && left=5
+        sleep "$left"
+        continue
+      fi
+      rollover=1; break
+    fi
     [ "$left" -gt 30 ] && left=30
     sleep "$left"
   done
@@ -706,7 +787,15 @@ do_check() {
     # Releasing on a bogus epoch too. Requiring epoch > 0 made a zero or missing
     # value an unbreakable pause: every tool denied forever, including the one
     # that would lift it, so the only way out was an external terminal.
-    if [ -z "$S_reset" ] || [ "$S_reset" -le 0 ] || [ "$left" -le 0 ]; then
+    # The clock striking is not the window turning over — for a short while after
+    # it the account still reports the window that just closed. Releasing on the
+    # instant handed out permission on a percentage nobody had measured yet, and
+    # the reading that landed a second later denied the same tool again. The gate
+    # is where every other session meets the rollover, so it waits out the same
+    # grace the held turn does. A missing or bogus reset time still releases at
+    # once: that release exists to break a deadlock, and delaying it re-creates
+    # the deadlock it is for.
+    if [ -z "$S_reset" ] || [ "$S_reset" -le 0 ] || [ $(( left + RESUME_GRACE )) -le 0 ]; then
       release
       notify "Session window reset — Keeper released the pause."
       maybe_refresh

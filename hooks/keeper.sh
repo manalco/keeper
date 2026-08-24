@@ -63,6 +63,16 @@ WINDOW_SECONDS=18000
 # instead would let any denial anywhere in the account restart the next turn to
 # end in any session, which is a restart with no interrupted work behind it.
 STRANDED_SECONDS=120
+# How long to wait after the clock says the window turned over, before reading it
+# again and putting the model back to work. The rollover happens on the account's
+# clock, not this one, and for a short while after it `/usage` still reports the
+# window that just ended — its percentage as much as its label. Answering the
+# instant the clock struck therefore restarted the work against the old reading:
+# the probe the release forces wrote the ending window's 96% straight back, and
+# the next tool call was denied on the spot, a second after the model had been
+# told to carry on. A minute is enough for the account to agree that the window
+# moved. The seam is for the self-check, which cannot afford to wait it out.
+RESUME_GRACE="${KEEPER_RESUME_GRACE:-60}"
 
 # The denial is the only instruction the model gets, and everything after the
 # numbers is what decides whether the work restarts. It says end the turn,
@@ -632,7 +642,7 @@ do_stop() {
   # Sleep in short spans instead of one long one, re-reading state each time, so
   # a pause lifted from another terminal (`threshold 99`, `off`) is noticed and
   # the turn ends rather than sitting until the original reset time.
-  local now deadline left rollover=0 keep_reading=""
+  local now deadline left rollover=0 keep_reading="" graced=""
   now=$(date +%s)
   deadline=$(( now + WINDOW_SECONDS + 300 ))
   while :; do
@@ -657,7 +667,26 @@ do_stop() {
     # Releasing the pause is left to the gate, which does it on the next call.
     [ -n "$S_reset" ] && [ "$S_reset" -gt 0 ] || break
     left=$(( S_reset - now ))
-    if [ "$left" -le 0 ]; then rollover=1; break; fi
+    if [ "$left" -le 0 ]; then
+      # First time this reset time comes due, do not answer on it. Force a read,
+      # wait out the grace, and come round again: by then the account reports the
+      # new window, `reading_cleared` sees it above, and the release keeps that
+      # reading instead of the one belonging to the window that just closed. If
+      # the new reading says the window is genuinely still full, the probe has
+      # also written the next reset time and this loop simply waits for it.
+      #
+      # Only once per reset time, so a probe that never lands cannot spin here:
+      # the second time the same moment comes due, the turn is restarted on the
+      # old terms, which is what it did before this existed.
+      if [ "$graced" != "$S_reset" ]; then
+        graced="$S_reset"
+        S_fetched=0
+        maybe_refresh
+        sleep "$RESUME_GRACE"
+        continue
+      fi
+      rollover=1; break
+    fi
     [ "$left" -gt 30 ] && left=30
     sleep "$left"
   done

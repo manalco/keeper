@@ -111,6 +111,9 @@ PY
 # No case here may spawn the real CLI; the one that must prove the detached
 # refresh works clears this and supplies a fixture the child inherits.
 export KEEPER_NO_REFRESH=1
+# The grace before a restart is a minute in real life. Cases that need to observe
+# it set their own; the rest must not sit through it.
+export KEEPER_RESUME_GRACE=2
 
 [ -x "$KEEPER" ] || { echo "keeper.sh missing or not executable: $KEEPER"; exit 1; }
 
@@ -594,6 +597,48 @@ el=$(( $(date +%s) - s ))
 if [ "$el" -ge 1 ] && [ "$el" -lt 30 ]; then ok "the turn is held open until the reset (${el}s)"
 else bad "the turn is held open until the reset" "1-29s" "${el}s"; fi
 assert_contains "and then continues" '"decision":"block"' "$out"
+
+# The rollover happens on the account's clock, and for a moment after it /usage
+# still reports the window that just closed. Answering the instant the recorded
+# reset time came due restarted the work against that old reading — the release
+# forced a probe, the probe wrote the ending window's percentage back, and the
+# next tool call was denied a second after the model was told to carry on. The
+# wait now reads the window again before it answers, and the reading it finds is
+# the one that survives: a fabricated 0 would say the restart still ran on the
+# old terms.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) + 1 ))"
+( sleep 2; probe_with 42 "$(clause_in 5)" ) &
+lander=$!
+s=$(date +%s)
+out=$(KEEPER_RESUME_GRACE=6 bash "$KEEPER" stop </dev/null 2>/dev/null)
+el=$(( $(date +%s) - s ))
+# Read the state before waiting on the injector. Answering early leaves the
+# fabricated 0 behind and the injected reading lands afterwards, which looks
+# identical once both have run — the whole difference is which one was on disk
+# when the turn was restarted.
+pct_at_answer=$(state pct)
+wait "$lander" 2>/dev/null
+if [ "$el" -ge 6 ]; then ok "the restart waits out the grace before answering (${el}s)"
+else bad "the restart waits out the grace before answering" ">=6s" "${el}s"; fi
+assert_contains "and then restarts the turn" '"decision":"block"' "$out"
+assert_eq "and answers on the reading taken after it" "42" "$pct_at_answer"
+assert_eq "and the pause is lifted" "0" "$(state blocked)"
+
+# A probe that never lands must not strand the turn in that wait: the same reset
+# time coming due twice restarts on the old terms rather than spinning.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) + 1 ))"
+s=$(date +%s)
+out=$(KEEPER_RESUME_GRACE=4 bash "$KEEPER" stop </dev/null 2>/dev/null)
+el=$(( $(date +%s) - s ))
+if [ "$el" -ge 4 ]; then ok "a reading that never lands still restarts the turn (${el}s)"
+else bad "a reading that never lands still restarts the turn" ">=4s" "${el}s"; fi
+assert_contains "and it says so" '"decision":"block"' "$out"
 
 # A window that turns over earlier than the recorded reset time announces itself
 # as a fresh reading under the threshold, not as a clock striking. The held turn

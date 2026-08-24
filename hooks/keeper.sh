@@ -73,6 +73,14 @@ STRANDED_SECONDS=120
 # told to carry on. A minute is enough for the account to agree that the window
 # moved. The seam is for the self-check, which cannot afford to wait it out.
 RESUME_GRACE="${KEEPER_RESUME_GRACE:-60}"
+RESUME_GRACE_MAX="${KEEPER_RESUME_GRACE_MAX:-300}"
+# Filtered like every other number that arrives from outside. A non-numeric value
+# made sleep fail on the spot, which collapsed the grace to nothing and put the
+# stale-reading bug back without a word — the worst way for a guard to break.
+# Capped because this is the one wait the loop cannot re-examine in the middle of.
+case "$RESUME_GRACE_MAX" in ''|*[!0-9]*) RESUME_GRACE_MAX=300 ;; esac
+case "$RESUME_GRACE" in ''|*[!0-9]*) RESUME_GRACE=60 ;; esac
+[ "$RESUME_GRACE" -gt "$RESUME_GRACE_MAX" ] && RESUME_GRACE="$RESUME_GRACE_MAX"
 
 # The denial is the only instruction the model gets, and everything after the
 # numbers is what decides whether the work restarts. It says end the turn,
@@ -203,6 +211,20 @@ ttl_for() {
   elif [ "$p" -ge 90 ];    then printf '90'
   elif [ "$p" -ge 70 ];    then printf '180'
   else printf '600'; fi
+}
+
+# The loop sleeps in short spans so a pause lifted from another terminal is
+# noticed within one of them. The grace has to keep that promise: sleeping it in
+# one span would hold the turn for its whole length against a guard already
+# switched off.
+sleep_chunked() { # seconds
+  local left="${1:-0}" span
+  while [ "$left" -gt 0 ]; do
+    [ "$(enabled)" = "1" ] || return 0
+    span="$left"; [ "$span" -gt 30 ] && span=30
+    sleep "$span"
+    left=$(( left - span ))
+  done
 }
 
 human_left() { # seconds -> "2h14m" / "9m" / "<1m"
@@ -650,7 +672,14 @@ do_stop() {
     [ "$S_blocked" = "1" ] || break
     [ "$(enabled)" = "1" ] || break
     now=$(date +%s)
-    [ "$now" -ge "$deadline" ] && break
+    if [ "$now" -ge "$deadline" ]; then
+      # Out of time. Ending silently is right for a turn that never reached its
+      # rollover, but not for one that did and was only waiting out the grace:
+      # that restart is already owed, and swallowing it here loses the work for
+      # the sake of a reading a minute fresher.
+      [ -n "$graced" ] && rollover=1
+      break
+    fi
     # A held turn makes no tool calls, so nothing else refreshes the reading it
     # is waiting on. Without this the only news it could ever receive was a probe
     # some other session happened to run, and a lone paused session slept blind
@@ -682,7 +711,7 @@ do_stop() {
         graced="$S_reset"
         S_fetched=0
         maybe_refresh
-        sleep "$RESUME_GRACE"
+        sleep_chunked "$RESUME_GRACE"
         continue
       fi
       rollover=1; break

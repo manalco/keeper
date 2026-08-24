@@ -640,6 +640,51 @@ if [ "$el" -ge 4 ]; then ok "a reading that never lands still restarts the turn 
 else bad "a reading that never lands still restarts the turn" ">=4s" "${el}s"; fi
 assert_contains "and it says so" '"decision":"block"' "$out"
 
+# The grace is the one wait the loop cannot re-check in the middle of, and it is
+# the only number here that comes from the environment. A malformed value used to
+# make sleep fail on the spot, which collapsed the grace to nothing and quietly
+# put the bug back; an oversized one turned a bounded wait into an unbounded one.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) + 1 ))"
+s=$(date +%s)
+out=$(KEEPER_RESUME_GRACE="not a number" KEEPER_RESUME_GRACE_MAX=3 \
+  bash "$KEEPER" stop </dev/null 2>/dev/null)
+el=$(( $(date +%s) - s ))
+if [ "$el" -ge 3 ]; then ok "a malformed grace does not collapse to nothing (${el}s)"
+else bad "a malformed grace does not collapse to nothing" ">=3s" "${el}s"; fi
+assert_contains "and the turn is still restarted" '"decision":"block"' "$out"
+
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) + 1 ))"
+s=$(date +%s)
+out=$(KEEPER_RESUME_GRACE=99999 KEEPER_RESUME_GRACE_MAX=3 \
+  bash "$KEEPER" stop </dev/null 2>/dev/null)
+el=$(( $(date +%s) - s ))
+if [ "$el" -ge 3 ] && [ "$el" -lt 30 ]; then ok "an oversized grace is clamped (${el}s)"
+else bad "an oversized grace is clamped" "3-29s" "${el}s"; fi
+
+# Switching the guard off during the grace has to be noticed, like every other
+# span this loop sleeps — otherwise the one wait that is not chunked holds the
+# turn for its whole length against a guard that is already gone.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) + 1 ))"
+( sleep 2; bash "$KEEPER" off >/dev/null 2>&1 ) &
+killer=$!
+s=$(date +%s)
+out=$(KEEPER_RESUME_GRACE=60 KEEPER_RESUME_GRACE_MAX=60 \
+  bash "$KEEPER" stop </dev/null 2>/dev/null)
+el=$(( $(date +%s) - s ))
+wait "$killer" 2>/dev/null
+if [ "$el" -lt 45 ]; then ok "the guard going off is noticed during the grace (${el}s)"
+else bad "the guard going off is noticed during the grace" "<45s" "${el}s"; fi
+assert_eq "and no turn is restarted" "" "$out"
+
 # A window that turns over earlier than the recorded reset time announces itself
 # as a fresh reading under the threshold, not as a clock striking. The held turn
 # has to accept that as the rollover it is: waiting for the recorded time would

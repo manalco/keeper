@@ -111,6 +111,9 @@ PY
 # No case here may spawn the real CLI; the one that must prove the detached
 # refresh works clears this and supplies a fixture the child inherits.
 export KEEPER_NO_REFRESH=1
+# The grace before a restart is a minute in real life. Cases that need to observe
+# it set their own; the rest must not sit through it.
+export KEEPER_RESUME_GRACE=2
 
 [ -x "$KEEPER" ] || { echo "keeper.sh missing or not executable: $KEEPER"; exit 1; }
 
@@ -594,6 +597,133 @@ el=$(( $(date +%s) - s ))
 if [ "$el" -ge 1 ] && [ "$el" -lt 30 ]; then ok "the turn is held open until the reset (${el}s)"
 else bad "the turn is held open until the reset" "1-29s" "${el}s"; fi
 assert_contains "and then continues" '"decision":"block"' "$out"
+
+# The rollover happens on the account's clock, and for a moment after it /usage
+# still reports the window that just closed. Answering the instant the recorded
+# reset time came due restarted the work against that old reading — the release
+# forced a probe, the probe wrote the ending window's percentage back, and the
+# next tool call was denied a second after the model was told to carry on. The
+# wait now reads the window again before it answers, and the reading it finds is
+# the one that survives: a fabricated 0 would say the restart still ran on the
+# old terms.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) + 1 ))"
+( sleep 2; probe_with 42 "$(clause_in 5)" ) &
+lander=$!
+s=$(date +%s)
+out=$(KEEPER_RESUME_GRACE=6 bash "$KEEPER" stop </dev/null 2>/dev/null)
+el=$(( $(date +%s) - s ))
+# Read the state before waiting on the injector. Answering early leaves the
+# fabricated 0 behind and the injected reading lands afterwards, which looks
+# identical once both have run — the whole difference is which one was on disk
+# when the turn was restarted.
+pct_at_answer=$(state pct)
+wait "$lander" 2>/dev/null
+if [ "$el" -ge 6 ]; then ok "the restart waits out the grace before answering (${el}s)"
+else bad "the restart waits out the grace before answering" ">=6s" "${el}s"; fi
+assert_contains "and then restarts the turn" '"decision":"block"' "$out"
+assert_eq "and answers on the reading taken after it" "42" "$pct_at_answer"
+assert_eq "and the pause is lifted" "0" "$(state blocked)"
+
+# A probe that never lands must not strand the turn in that wait: the same reset
+# time coming due twice restarts on the old terms rather than spinning.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) + 1 ))"
+s=$(date +%s)
+out=$(KEEPER_RESUME_GRACE=4 bash "$KEEPER" stop </dev/null 2>/dev/null)
+el=$(( $(date +%s) - s ))
+if [ "$el" -ge 4 ]; then ok "a reading that never lands still restarts the turn (${el}s)"
+else bad "a reading that never lands still restarts the turn" ">=4s" "${el}s"; fi
+assert_contains "and it says so" '"decision":"block"' "$out"
+
+# The grace is the one wait the loop cannot re-check in the middle of, and it is
+# the only number here that comes from the environment. A malformed value used to
+# make sleep fail on the spot, which collapsed the grace to nothing and quietly
+# put the bug back; an oversized one turned a bounded wait into an unbounded one.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) + 1 ))"
+s=$(date +%s)
+out=$(KEEPER_RESUME_GRACE="not a number" KEEPER_RESUME_GRACE_MAX=3 \
+  bash "$KEEPER" stop </dev/null 2>/dev/null)
+el=$(( $(date +%s) - s ))
+if [ "$el" -ge 3 ]; then ok "a malformed grace does not collapse to nothing (${el}s)"
+else bad "a malformed grace does not collapse to nothing" ">=3s" "${el}s"; fi
+assert_contains "and the turn is still restarted" '"decision":"block"' "$out"
+
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) + 1 ))"
+s=$(date +%s)
+out=$(KEEPER_RESUME_GRACE=99999 KEEPER_RESUME_GRACE_MAX=3 \
+  bash "$KEEPER" stop </dev/null 2>/dev/null)
+el=$(( $(date +%s) - s ))
+if [ "$el" -ge 3 ] && [ "$el" -lt 30 ]; then ok "an oversized grace is clamped (${el}s)"
+else bad "an oversized grace is clamped" "3-29s" "${el}s"; fi
+
+# Switching the guard off during the grace has to be noticed, like every other
+# span this loop sleeps — otherwise the one wait that is not chunked holds the
+# turn for its whole length against a guard that is already gone.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) + 1 ))"
+( sleep 2; bash "$KEEPER" off >/dev/null 2>&1 ) &
+killer=$!
+s=$(date +%s)
+out=$(KEEPER_RESUME_GRACE=60 KEEPER_RESUME_GRACE_MAX=60 \
+  bash "$KEEPER" stop </dev/null 2>/dev/null)
+el=$(( $(date +%s) - s ))
+wait "$killer" 2>/dev/null
+if [ "$el" -lt 45 ]; then ok "the guard going off is noticed during the grace (${el}s)"
+else bad "the guard going off is noticed during the grace" "<45s" "${el}s"; fi
+assert_eq "and no turn is restarted" "" "$out"
+
+# The pause is one flag for the whole account, so while this turn is parked in
+# the grace any other session's tool call reaches the gate and can release on the
+# clock. The pause is then gone, but the rollover it came from is this loop's
+# rollover; treating it as "someone lifted the pause" and ending quietly strands
+# the very work the wait exists to restart.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) + 1 ))"
+( sleep 3; set_field blocked 0 ) &
+releaser=$!
+out=$(KEEPER_RESUME_GRACE=9 bash "$KEEPER" stop </dev/null 2>/dev/null)
+wait "$releaser" 2>/dev/null
+assert_contains "a release from elsewhere during the wait still restarts the turn" \
+  '"decision":"block"' "$out"
+
+# The gate has the same problem the wait had, and it is the one every other
+# session hits: releasing the moment the clock strikes hands out permission on a
+# fabricated zero, and the reading that lands a second later still belongs to the
+# window that closed. It holds the pause through the grace instead.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) - 1 ))"
+assert_contains "the gate holds the pause through the grace" "deny" \
+  "$(KEEPER_RESUME_GRACE=30 bash "$KEEPER" check 2>/dev/null)"
+set_field reset_epoch "$(( $(date +%s) - 60 ))"
+assert_not_contains "and releases once the grace has passed" "deny" \
+  "$(KEEPER_RESUME_GRACE=30 bash "$KEEPER" check 2>/dev/null)"
+
+# A reading is only evidence while it is a reading. The release that breaks a
+# deadlock writes a zero nobody measured and marks it by zeroing its timestamp,
+# so anything deciding on the percentage has to refuse the unmeasured one.
+new_home
+probe_with 42 "$(clause_in 2)"
+set_field blocked 1
+set_field fetched_at 0
+assert_contains "a percentage nobody measured releases nothing" "deny" \
+  "$(bash "$KEEPER" check 2>/dev/null)"
 
 # A window that turns over earlier than the recorded reset time announces itself
 # as a fresh reading under the threshold, not as a clock striking. The held turn

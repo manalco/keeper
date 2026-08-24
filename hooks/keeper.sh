@@ -438,15 +438,40 @@ until_phrase() { # "until 3:50pm" when the label is trustworthy, else silence
   if [ -n "$S_label" ] && [ "${S_est:-0}" != "1" ]; then printf ', until %s' "$S_label"; fi
 }
 
-# Lifting a pause. The stale high reading has to go with it, or the very next
-# tool call re-blocks; fetched_at is zeroed rather than inventing a percentage,
-# which forces an immediate fresh probe.
-release() {
+# Is the pause over according to the reading rather than the clock? A percentage
+# only falls back under the threshold once the window turned over, so this is the
+# window itself saying so — and it is the only signal available when the rollover
+# lands earlier than the reset time that was recorded when the pause began.
+#
+# The gate and the held-open turn both have to ask it. They used to ask different
+# questions of the same file: the gate released on the clock, the turn waited on
+# the clock, and a probe that had already read the new window sat in the state
+# contradicting both. That disagreement is what denied every tool "at 0% (limit
+# 95%)" while the turn it was supposed to restart slept on.
+#
+# The threshold is read live, not captured at probe time, so a threshold raised
+# from another terminal is honoured here too, and the answer holds even when the
+# probe is dead.
+reading_cleared() { [ -n "$S_pct" ] && [ "$S_pct" -lt "$(threshold)" ]; }
+
+# Lifting a pause. Released on the clock, the cached reading belongs to the window
+# that just ended, so it has to go with it or the very next tool call re-blocks;
+# fetched_at is zeroed rather than inventing a percentage, which forces an
+# immediate fresh probe.
+#
+# Released on the reading, the opposite holds: that percentage is already the new
+# window's and is true. Zeroing it there would put a 0% on the statusline and in
+# `status` for an account nowhere near it — a lie that outlives the next probe if
+# the probe is broken.
+release() { # [keep]  — keep: the cached reading is the new window's, not the old
   set_field blocked 0
-  set_field pct 0
-  set_field fetched_at 0
+  if [ "${1:-}" != "keep" ]; then
+    set_field pct 0
+    set_field fetched_at 0
+    S_pct=0; S_fetched=0
+  fi
   disarm_timer
-  S_pct=0; S_fetched=0; S_blocked=0
+  S_blocked=0
 }
 
 # ---------------------------------------------------------------------------
@@ -497,7 +522,7 @@ do_stop() {
   # Sleep in short spans instead of one long one, re-reading state each time, so
   # a pause lifted from another terminal (`threshold 99`, `off`) is noticed and
   # the turn ends rather than sitting until the original reset time.
-  local now deadline left rollover=0
+  local now deadline left rollover=0 keep_reading=""
   now=$(date +%s)
   deadline=$(( now + WINDOW_SECONDS + 300 ))
   while :; do
@@ -506,6 +531,17 @@ do_stop() {
     [ "$(enabled)" = "1" ] || break
     now=$(date +%s)
     [ "$now" -ge "$deadline" ] && break
+    # A held turn makes no tool calls, so nothing else refreshes the reading it
+    # is waiting on. Without this the only news it could ever receive was a probe
+    # some other session happened to run, and a lone paused session slept blind
+    # through the rollover it was holding the turn open for.
+    maybe_refresh
+    # The rollover can land earlier than the reset time recorded when the pause
+    # began, and when it does the probe writes the new window's percentage next
+    # to a reset time five hours further out — so waiting on that time sits out
+    # a window that already restarted, until the deadline ends the turn with no
+    # resume at all. The reading is the rollover; take it as one.
+    if reading_cleared; then rollover=1; keep_reading=keep; break; fi
     # A corrupt or missing reset time is not a rollover and never becomes one, so
     # the wait ends here rather than hanging on a moment that will not arrive.
     # Releasing the pause is left to the gate, which does it on the next call.
@@ -521,7 +557,7 @@ do_stop() {
   # rolling over may put the model back to work.
   [ "$rollover" = "1" ] || exit 0
 
-  release
+  release $keep_reading
   # A release that did not reach disk leaves blocked=1 behind, and then every
   # following turn end would resume again, one turn a minute, for as long as the
   # disk stays unwritable. Confirm the pause is really gone before answering.
@@ -562,6 +598,16 @@ do_check() {
     # that would lift it, so the only way out was an external terminal.
     if [ -z "$S_reset" ] || [ "$S_reset" -le 0 ] || [ "$left" -le 0 ]; then
       release
+      notify "Session window reset — Keeper released the pause."
+      maybe_refresh
+      exit 0
+    fi
+    # The reset time is only a prediction, so it is not the only way out. A
+    # reading already under the threshold is the window reporting its own
+    # rollover, hours before the predicted moment, and holding the pause against
+    # it denies every tool — including the one that would lift it.
+    if reading_cleared; then
+      release keep
       notify "Session window reset — Keeper released the pause."
       maybe_refresh
       exit 0

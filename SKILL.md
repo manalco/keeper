@@ -22,13 +22,17 @@ running. This skill is the control surface: reading state and changing settings.
 - A detached timer sleeps until the reset moment and announces the rollover, so a
   paused session needs nobody watching the clock.
 - The pause releases itself once the reset time passes; the cached percentage is
-  set to 0 because the window genuinely restarts empty.
+  set to 0 because the window genuinely restarts empty. It also releases as soon
+  as a fresh reading lands under the threshold, which is how a window that rolls
+  over earlier than predicted announces itself — that reading is kept, not zeroed,
+  because it is already the new window's.
 - `Stop` holds the interrupted turn open across the rollover and then answers
   `block`, which restarts the same turn with its context intact — so the work
   resumes on its own instead of waiting for the user to type. Waiting is a
-  sleeping shell and costs nothing. Only a real rollover restarts the turn: an
-  estimated reset time, a guard switched off mid-wait, or an unreadable state
-  file all end the turn quietly instead.
+  sleeping shell and costs nothing, and it refreshes the reading as it goes, so
+  an early rollover ends the wait instead of sleeping through it. Only a real
+  rollover restarts the turn: an estimated reset time, a guard switched off
+  mid-wait, or an unreadable state file all end the turn quietly instead.
 - The statusline badge shows `[KEEPER:33%]`, coloured against the configured
   threshold, and `[KEEPER:96% BLOCKED 2h14m]` while paused. Suffixes are graded:
   `~` means the percentage is exact but the reset time is estimated, `?` means the

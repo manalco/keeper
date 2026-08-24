@@ -49,6 +49,12 @@ PROBE_ATTEMPT="$KEEPER_HOME/.keeper-probe-attempt"
 PROBE_CWD="$KEEPER_HOME/.keeper-probe"
 RESUMED="$KEEPER_HOME/.keeper-resumed"
 HOLD="$KEEPER_HOME/.keeper-hold"
+# Work stopped for the pause and has not moved since. The gate writes it on every
+# denial and clears it the moment a tool runs again, which makes it the answer to
+# the one question the Stop hook could not previously ask: is there anything left
+# to restart? Without it, a pause that lifted before the turn ended took the
+# restart with it — nothing was holding the turn, and nothing re-invokes a model.
+PENDING="$KEEPER_HOME/.keeper-pending"
 DEFAULT_THRESHOLD=95
 WINDOW_SECONDS=18000
 
@@ -62,6 +68,12 @@ REFUSED=""
 for f in "$STATE" "$CONFIG" "$LASTCHECK" "$TIMER" "$RESUMED"; do
   if [ -L "$f" ]; then REFUSED="$f"; break; fi
 done
+
+# The record gets the same refusal as everything else Keeper writes, but locally:
+# adding it to the list above would let a link planted here switch the whole guard
+# off, and a planted link should cost the restart, not the protection. Removing is
+# always safe — rm takes the link, never what it points at.
+pending_ok() { [ -z "$REFUSED" ] && [ ! -L "$PENDING" ]; }
 
 # ---------------------------------------------------------------------------
 # state
@@ -152,11 +164,16 @@ ttl_for() {
   else printf '600'; fi
 }
 
-human_left() { # seconds -> "2h14m" / "9m"
+human_left() { # seconds -> "2h14m" / "9m" / "<1m"
   local s="${1:-0}"
   [ "$s" -lt 0 ] && s=0
   local h=$((s/3600)) m=$(((s%3600)/60))
-  if [ "$h" -gt 0 ]; then printf '%dh%dm' "$h" "$m"; else printf '%dm' "$m"; fi
+  # Truncating minutes printed "blocked for 0m" for the last 59 seconds of a
+  # pause, which reads as a contradiction and was taken for one: a pause with
+  # nothing left to wait for looks exactly like a pause that has gone stale.
+  if   [ "$h" -gt 0 ]; then printf '%dh%dm' "$h" "$m"
+  elif [ "$m" -gt 0 ]; then printf '%dm' "$m"
+  else printf '<1m'; fi
 }
 
 write_state() { # pct reset_epoch reset_human blocked reset_est
@@ -474,6 +491,20 @@ release() { # [keep]  — keep: the cached reading is the new window's, not the 
   S_blocked=0
 }
 
+# The restart, written in one place because two paths reach it: the turn held open
+# across the rollover, and the turn that ended after the pause had already lifted.
+# Marking the restart is what stops it firing twice, and the record is spent here
+# because the work it stood for is moving again.
+#
+# Static text and nothing from disk, so the state file cannot reshape this JSON or
+# slip instructions into the turn it restarts.
+resume_answer() {
+  touch "$RESUMED" 2>/dev/null
+  rm -f "$PENDING" 2>/dev/null
+  printf '{"decision":"block","reason":"KEEPER RESUME — the 5-hour session window has reset and the pause is lifted. Pick the interrupted work back up exactly where the pause stopped you and finish it. Do not wait for the user to ask again, and do not re-summarise what happened; just carry on and say briefly that the window reset."}\n'
+  exit 0
+}
+
 # ---------------------------------------------------------------------------
 # stop — hold the paused turn open across the rollover
 # ---------------------------------------------------------------------------
@@ -483,7 +514,31 @@ do_stop() {
   load_state || exit 0
   # Only a turn that actually hit the pause is held; any other stop is none of
   # Keeper's business and must cost nothing.
-  [ "$S_blocked" = "1" ] || exit 0
+  #
+  # Except one: the pause may already have lifted while this turn was ending —
+  # released by another session, by a raised threshold, or by the gate itself on
+  # a reading that came back under the limit. Then there is no pause to hold, the
+  # wait below never starts, and nothing re-invokes the model. That is the shape
+  # the failure takes from the outside: the job simply stops and waits for the
+  # user to type, having already announced that it would continue on its own.
+  # The record answers it — the work was interrupted and has not moved since.
+  if [ "$S_blocked" != "1" ]; then
+    pending_ok || exit 0
+    [ -f "$PENDING" ] || exit 0
+    local now_p; now_p=$(date +%s)
+    # A record older than a whole window cannot belong to work anyone is still
+    # waiting on: no pause lasts longer than the window it is protecting. Left
+    # unbounded it would restart a session that had long since moved on, talking
+    # to a user who never asked for it.
+    if [ $(( now_p - $(mtime "$PENDING") )) -ge $(( WINDOW_SECONDS + 300 )) ]; then
+      rm -f "$PENDING" 2>/dev/null; exit 0
+    fi
+    # The same loop guard the rollover path uses: a restart that just fired must
+    # not fire again on the stop it caused.
+    [ $(( now_p - $(mtime "$RESUMED") )) -lt 60 ] && exit 0
+    notify "Session window reset — resuming the paused work."
+    resume_answer
+  fi
   # An estimated reset is a 15-minute placeholder, not a reading. Waiting it out
   # and then sending the model back to work would restart the job with the window
   # possibly still full — the one outcome worse than stopping too early.
@@ -568,11 +623,7 @@ do_stop() {
   # timer may never have been armed at all, so the announcement is made here
   # rather than left to whichever of the two woke first.
   notify "Session window reset — resuming the paused work."
-  touch "$RESUMED" 2>/dev/null
-  # Static text and nothing from disk, so the state file cannot reshape this JSON
-  # or slip instructions into the turn it restarts.
-  printf '{"decision":"block","reason":"KEEPER RESUME — the 5-hour session window has reset and the pause is lifted. Pick the interrupted work back up exactly where the pause stopped you and finish it. Do not wait for the user to ask again, and do not re-summarise what happened; just carry on and say briefly that the window reset."}\n'
-  exit 0
+  resume_answer
 }
 
 # ---------------------------------------------------------------------------
@@ -585,6 +636,10 @@ do_check() {
   [ -z "$REFUSED" ] && touch "$LASTCHECK" 2>/dev/null
   [ "$(enabled)" = "1" ] || exit 0
   [ -n "$REFUSED" ] && exit 0
+  # Reaching a tool call at all means the work is moving, so whatever the last
+  # denial recorded is spent. The deny branches below write it again; keeping it
+  # any longer would leave a restart owed to work that already carried on.
+  [ -f "$PENDING" ] && rm -f "$PENDING" 2>/dev/null
   load_state || { maybe_refresh; exit 0; }
   maybe_refresh
 
@@ -613,7 +668,8 @@ do_check() {
       exit 0
     fi
     arm_timer "$left" "$S_reset"
-    deny "KEEPER PAUSE ACTIVE. Session window at ${S_pct:-unknown}% (limit ${th}%). All tools stay blocked for $(human_left "$left")$(until_phrase). Stop now: do not retry this tool, do not switch tools, do not keep working in prose. Tell the user Keeper paused the session and that it will resume this work by itself once the window resets."
+    pending_ok && touch "$PENDING" 2>/dev/null
+    deny "KEEPER PAUSE ACTIVE. Session window at ${S_pct:-unknown}% (limit ${th}%). All tools stay blocked for $(human_left "$left")$(until_phrase). Stop now: do not retry this tool, do not switch tools, do not keep working in prose. Say in one line that Keeper paused the session and when it lifts. End the turn there, and end it deliberately: ending the turn is what hands it to Keeper, which holds it open and resumes it automatically at the rollover. The restart arrives on its own as KEEPER RESUME and carries this work on from exactly here. The user does not need to reply, re-ask, or type anything for that to happen, so do not ask them to — inviting a reply is what turns an automatic restart into a job sitting still."
     exit 0
   fi
 
@@ -626,7 +682,8 @@ do_check() {
     set_field blocked 1
     arm_timer "$left" "${S_reset:-0}"
     notify "Session window at ${S_pct}% — work paused$(until_phrase)."
-    deny "KEEPER TRIPPED at ${S_pct}% of the 5-hour session window (limit ${th}%). All tools are now blocked for $(human_left "$left")$(until_phrase). Stop immediately so the remaining budget is not spent: do not retry, do not continue in prose. Tell the user Keeper paused the session to protect the window, and that it will resume this work by itself once the window resets."
+    pending_ok && touch "$PENDING" 2>/dev/null
+    deny "KEEPER TRIPPED at ${S_pct}% of the 5-hour session window (limit ${th}%). All tools are now blocked for $(human_left "$left")$(until_phrase). Stop immediately so the remaining budget is not spent: do not retry, do not switch tools, do not continue in prose. Say in one line that Keeper paused the session to protect the window, and when it lifts. End the turn there, and end it deliberately: ending the turn is what hands it to Keeper, which holds it open and resumes it automatically at the rollover. The restart arrives on its own as KEEPER RESUME and carries this work on from exactly here. The user does not need to reply, re-ask, or type anything for that to happen, so do not ask them to — inviting a reply is what turns an automatic restart into a job sitting still."
     exit 0
   fi
   exit 0

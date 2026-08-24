@@ -199,6 +199,55 @@ assert_eq "block marker cleared" "0" "$(state blocked)"
 assert_eq "release disarms the timer" "absent" \
   "$([ -f "$KEEPER_HOME/.keeper-timer.pid" ] && echo present || echo absent)"
 
+# The clock is not the only thing that ends a pause. When the window rolls over
+# the probe reads a fresh low percentage while the recorded reset time is still
+# in the future, so a release gated only on that time keeps denying every tool
+# against a reading that says there is nothing left to protect. The percentage
+# the guard trips on is the percentage it has to let go on.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+probe_with 0 "$(clause_in 2)"
+out=$(bash "$KEEPER" check 2>/dev/null)
+assert_not_contains "a fresh reading under threshold stops denying" "deny" "$out"
+assert_eq "block marker cleared by the fresh reading" "0" "$(state blocked)"
+assert_eq "releasing on the reading disarms the timer" "absent" \
+  "$([ -f "$KEEPER_HOME/.keeper-timer.pid" ] && echo present || echo absent)"
+
+# A reading that is still at or above the threshold must keep the pause, or the
+# release turns into a bypass: the one case the guard exists for.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+probe_with 97 "$(clause_in 2)"
+assert_contains "a reading still over threshold keeps denying" "deny" \
+  "$(bash "$KEEPER" check 2>/dev/null)"
+
+# The boundary itself, in both directions. Trip is `>= th` and release is
+# `< th`, exact complements. Loosening the release to `<= th` would let a
+# reading sitting exactly on the threshold trip and release forever, allowing
+# every other tool call through — a bypass at the one percentage that matters.
+new_home
+probe_with 95 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+probe_with 95 "$(clause_in 2)"
+assert_contains "a reading exactly at the threshold keeps denying" "deny" \
+  "$(bash "$KEEPER" check 2>/dev/null)"
+
+# Releasing on the clock has to drop the cached percentage, because that reading
+# belongs to the window that just ended and would re-block the next call.
+# Releasing on the reading is the opposite case: that percentage IS the new
+# window's, and zeroing it would leave the statusline and `status` reporting 0%
+# on an account that is nowhere near it — a lie that survives until the next
+# probe, and outlives it if the probe is broken.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+printf 'threshold=99\nenabled=1\n' > "$KEEPER_HOME/.keeper-config"
+bash "$KEEPER" check >/dev/null 2>&1
+assert_eq "releasing on the reading keeps the reading" "96" "$(state pct)"
+assert_eq "releasing on the reading still clears the pause" "0" "$(state blocked)"
+
 # --- config ------------------------------------------------------------------
 echo "config:"
 new_home
@@ -545,6 +594,28 @@ el=$(( $(date +%s) - s ))
 if [ "$el" -ge 1 ] && [ "$el" -lt 30 ]; then ok "the turn is held open until the reset (${el}s)"
 else bad "the turn is held open until the reset" "1-29s" "${el}s"; fi
 assert_contains "and then continues" '"decision":"block"' "$out"
+
+# A window that turns over earlier than the recorded reset time announces itself
+# as a fresh reading under the threshold, not as a clock striking. The held turn
+# has to accept that as the rollover it is: waiting for the recorded time would
+# sit on a window that already restarted, and the gate would meanwhile release
+# the pause and leave this turn to end silently, abandoning the work it is here
+# to restart.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) + 120 ))"
+( sleep 1; probe_with 0 "$(clause_in 5)" ) &
+roller=$!
+s=$(date +%s)
+out=$(bash "$KEEPER" stop </dev/null 2>/dev/null)
+el=$(( $(date +%s) - s ))
+wait "$roller" 2>/dev/null
+if [ "$el" -lt 35 ]; then ok "an early rollover ends the wait (${el}s)"
+else bad "an early rollover ends the wait" "<35s" "${el}s"; fi
+assert_contains "and resumes the paused work" '"decision":"block"' "$out"
+assert_eq "the early rollover clears the pause" "0" "$(state blocked)"
+assert_eq "and keeps the new window's reading" "0" "$(state pct)"
 
 # Only a real rollover may restart a turn. A corrupt reset time is not one: it
 # must neither wait on a moment that will not arrive nor drive the model back to

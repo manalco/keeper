@@ -86,6 +86,16 @@ valid timestamp to release made a zero or corrupt value an unbreakable pause:
 every tool denied indefinitely, including the command that would lift it, so the
 only way out was an external terminal.
 
+The clock is not the only way out either, because the reset time is a prediction
+and the percentage is a reading. A window that rolls over earlier than predicted
+shows up as a fresh reading under the threshold sitting next to a reset time
+still hours away, and a release gated only on that time then denies every tool
+with `at 0% (limit 95%)` until the stale hour passes — the lift command included.
+A percentage only falls back under the threshold once the window turned over, so
+Keeper releases on it too. That release keeps the reading rather than zeroing it:
+the number is already the new window's and is true, and a zero written over it
+would report an empty window for an account nowhere near one.
+
 In the moments right after a rollover, `/usage` still names the window that just
 ended. A reset label in the past therefore is not an error — the window is five
 hours long, so the next reset is that label plus five hours, and Keeper steps it
@@ -115,7 +125,11 @@ Four properties matter more than the mechanism:
   disappears, if the guard is switched off from another terminal, if the cap is
   reached, or if the reset time is unreadable — and every one of those ends the
   turn silently instead of putting the model back to work. "I stopped waiting" is
-  not "the window reset".
+  not "the window reset". A reading that has fallen back under the threshold *is*
+  the window reset, though, so the wait accepts it as one and resumes: it is what
+  an early rollover looks like from here, and the wait refreshes the reading
+  itself while it sleeps, since a held turn makes no tool calls and nothing else
+  would.
 - **An estimated reset never resumes.** When the probe cannot parse the reset
   clause it stores a placeholder fifteen minutes out. Waiting that out and then
   resuming would send the model back to work with the window still full, so a

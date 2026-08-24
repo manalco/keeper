@@ -685,6 +685,46 @@ if [ "$el" -lt 45 ]; then ok "the guard going off is noticed during the grace ($
 else bad "the guard going off is noticed during the grace" "<45s" "${el}s"; fi
 assert_eq "and no turn is restarted" "" "$out"
 
+# The pause is one flag for the whole account, so while this turn is parked in
+# the grace any other session's tool call reaches the gate and can release on the
+# clock. The pause is then gone, but the rollover it came from is this loop's
+# rollover; treating it as "someone lifted the pause" and ending quietly strands
+# the very work the wait exists to restart.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) + 1 ))"
+( sleep 3; set_field blocked 0 ) &
+releaser=$!
+out=$(KEEPER_RESUME_GRACE=9 bash "$KEEPER" stop </dev/null 2>/dev/null)
+wait "$releaser" 2>/dev/null
+assert_contains "a release from elsewhere during the wait still restarts the turn" \
+  '"decision":"block"' "$out"
+
+# The gate has the same problem the wait had, and it is the one every other
+# session hits: releasing the moment the clock strikes hands out permission on a
+# fabricated zero, and the reading that lands a second later still belongs to the
+# window that closed. It holds the pause through the grace instead.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch "$(( $(date +%s) - 1 ))"
+assert_contains "the gate holds the pause through the grace" "deny" \
+  "$(KEEPER_RESUME_GRACE=30 bash "$KEEPER" check 2>/dev/null)"
+set_field reset_epoch "$(( $(date +%s) - 60 ))"
+assert_not_contains "and releases once the grace has passed" "deny" \
+  "$(KEEPER_RESUME_GRACE=30 bash "$KEEPER" check 2>/dev/null)"
+
+# A reading is only evidence while it is a reading. The release that breaks a
+# deadlock writes a zero nobody measured and marks it by zeroing its timestamp,
+# so anything deciding on the percentage has to refuse the unmeasured one.
+new_home
+probe_with 42 "$(clause_in 2)"
+set_field blocked 1
+set_field fetched_at 0
+assert_contains "a percentage nobody measured releases nothing" "deny" \
+  "$(bash "$KEEPER" check 2>/dev/null)"
+
 # A window that turns over earlier than the recorded reset time announces itself
 # as a fresh reading under the threshold, not as a clock striking. The held turn
 # has to accept that as the rollover it is: waiting for the recorded time would

@@ -1,7 +1,7 @@
 # Keeper
 
 [![status](https://img.shields.io/badge/status-active-108C4A?style=flat-square)](#)
-[![self--check](https://img.shields.io/badge/self--check-147%2F147%20passing-2E7D32?style=flat-square)](#self-check)
+[![self--check](https://img.shields.io/badge/self--check-151%2F151%20passing-2E7D32?style=flat-square)](#self-check)
 [![token cost](https://img.shields.io/badge/token%20cost-~69%20tokens%2Fsession-1565C0?style=flat-square)](#what-it-costs)
 [![probe](https://img.shields.io/badge/probe-0%20API%20calls-1565C0?style=flat-square)](#how-it-works)
 [![threshold](https://img.shields.io/badge/default%20threshold-95%25-D97706?style=flat-square)](#configuration)
@@ -145,6 +145,14 @@ These properties matter more than the mechanism:
   there — the second time the same moment comes due, the turn is restarted on the
   old terms. Running out of time during the grace restarts it too: that restart
   is already owed, and dropping it to chase a fresher reading loses the work.
+
+  The gate keeps the same grace, because the gate is where every other session
+  meets the rollover. Releasing on the instant handed out permission on a
+  percentage nobody had measured, and the reading that landed a second later
+  denied the same tool again. A missing or bogus reset time still releases at
+  once — that release is there to break a deadlock, and delaying it would
+  re-create the one it exists for. The zero it writes is marked by zeroing the
+  timestamp beside it, and a percentage nobody measured now releases nothing.
 - **A restart does not need a turn to have been held.** Holding covers the
   ordinary case, where the turn ends while the pause is still on. When the pause
   lifts first — another session's gate, a raised threshold, a reading that came
@@ -259,7 +267,7 @@ Files:
 |---|---|
 | `~/.claude/skills/keeper/hooks/keeper.sh` | probe, gate, session block, the held-open turn, config |
 | `~/.claude/skills/keeper/hooks/keeper-statusline.sh` | `[KEEPER:NN%]` badge |
-| `~/.claude/skills/keeper/hooks/keeper-selfcheck.sh` | 147 offline assertions |
+| `~/.claude/skills/keeper/hooks/keeper-selfcheck.sh` | 151 offline assertions |
 | `~/.claude/skills/keeper/SKILL.md` | the control-surface skill |
 | `~/.claude/.keeper-state` | cached reading (`pct`, `reset_epoch`, `blocked`) |
 | `~/.claude/.keeper-config` | `threshold=95`, `enabled=1` |

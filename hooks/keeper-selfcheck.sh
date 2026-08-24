@@ -775,14 +775,43 @@ assert_eq "an allowed tool call clears the record" "0" \
   "$([ -f "$KEEPER_HOME/.keeper-pending" ] && echo 1 || echo 0)"
 assert_eq "and nothing is restarted" "" "$(bash "$KEEPER" stop </dev/null 2>/dev/null)"
 
-# A record older than a whole window cannot belong to work anyone is still
-# waiting on — the pause it came from could not have lasted that long.
+# The record is one file for the whole account, so it says a denial happened, not
+# which turn it happened to. Age is the only thing tying it back: the denied turn
+# ends moments later. A turn ending long afterwards belongs to some other session
+# going about its business, and restarting that one hands a user work they never
+# interrupted.
 new_home
 probe_with 96 "$(clause_in 2)"
 bash "$KEEPER" check >/dev/null 2>&1
 bash "$KEEPER" threshold 99 >/dev/null 2>&1
 touch -t 202001010101 "$KEEPER_HOME/.keeper-pending" 2>/dev/null
 assert_eq "a stale record restarts nothing" "" "$(bash "$KEEPER" stop </dev/null 2>/dev/null)"
+
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+bash "$KEEPER" threshold 99 >/dev/null 2>&1
+python3 - "$KEEPER_HOME/.keeper-pending" <<'PY2'
+import os, sys, time
+p = sys.argv[1]
+old = time.time() - 300
+os.utime(p, (old, old))
+PY2
+assert_eq "a record from an unrelated turn restarts nothing" "" \
+  "$(bash "$KEEPER" stop </dev/null 2>/dev/null)"
+
+# Every session parked behind one pause ends its turn the moment it lifts, and
+# each would find the same record. Restarting all of them spends the window that
+# was just protected, so the restart takes the same lock the wait does.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+bash "$KEEPER" threshold 99 >/dev/null 2>&1
+one=$(bash "$KEEPER" stop </dev/null 2>/dev/null) &
+two=$(bash "$KEEPER" stop </dev/null 2>/dev/null) &
+wait
+count=$(( $(bash "$KEEPER" stop </dev/null 2>/dev/null | grep -c 'decision') ))
+assert_eq "a spent record restarts nothing more" "0" "$count"
 
 new_home
 probe_with 96 "$(clause_in 2)"

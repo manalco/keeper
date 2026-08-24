@@ -1195,12 +1195,12 @@ cat > "$KEEPER_HOME/settings.json" <<'JSON'
 {"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"bash \"$HOME/.claude/skills/keeper/hooks/keeper.sh\" check"}]}]}}
 JSON
 assert_contains "status names an unwired hold" "timeout" \
-  "$(KEEPER_SETTINGS="$KEEPER_HOME/settings.json" bash "$KEEPER" status 2>/dev/null)"
+  "$(KEEPER_WAIT_CAP=18300 KEEPER_SETTINGS="$KEEPER_HOME/settings.json" bash "$KEEPER" status 2>/dev/null)"
 cat > "$KEEPER_HOME/settings.json" <<'JSON'
 {"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"bash \"$HOME/.claude/skills/keeper/hooks/keeper.sh\" check","timeout":18420}]}]}}
 JSON
 assert_not_contains "a wired hold is not reported as a problem" "unwired" \
-  "$(KEEPER_SETTINGS="$KEEPER_HOME/settings.json" bash "$KEEPER" status 2>/dev/null)"
+  "$(KEEPER_WAIT_CAP=18300 KEEPER_SETTINGS="$KEEPER_HOME/settings.json" bash "$KEEPER" status 2>/dev/null)"
 
 # --- misc --------------------------------------------------------------------
 echo "misc:"

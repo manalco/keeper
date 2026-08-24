@@ -77,6 +77,11 @@ if [ "$blocked" = "1" ] && [ -n "$reset_epoch" ] && [ "$reset_epoch" -gt "$now" 
   left=$(( reset_epoch - now ))
   h=$((left/3600)); m=$(((left%3600)/60))
   if [ "$h" -gt 0 ]; then countdown="${h}h${m}m"; else countdown="${m}m"; fi
+  # The estimated marker is applied further down, past this branch's exit, so a
+  # paused session showed a guessed countdown with nothing to say it was a guess
+  # — the same number the denial used to assert, in the one place a user glances
+  # at without reading a sentence.
+  [ "${est:-0}" = "1" ] && countdown="~$countdown"
   badge "$RED" ":${pct}% BLOCKED $countdown"
   exit 0
 fi

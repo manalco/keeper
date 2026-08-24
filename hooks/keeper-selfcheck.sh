@@ -516,8 +516,18 @@ gap=$(( $(state reset_epoch) - $(state fetched_at) ))
 if [ "$gap" -ge 17000 ]; then ok "an unreadable reset does not become a short pause (${gap}s)"
 else bad "an unreadable reset does not become a short pause" ">=17000s" "${gap}s"; fi
 
+# The bound has to be anchored to the first reading that could not be read, not
+# recomputed from each one. Probing continues every ninety seconds at this level,
+# and a bound recomputed from every probe is pushed further out than the time
+# that has passed — it never arrives, so the one clock that could end a pause
+# built on an unreadable reset recedes forever.
+first_bound=$(state reset_epoch)
+sleep 2
+probe_with 96 "resets in 12 minutes"
+assert_eq "a bound recomputed on every probe is no bound" "$first_bound" "$(state reset_epoch)"
+
 out=$(bash "$KEEPER" check 2>/dev/null)
-assert_contains "and the denial says the reset time was not read" "could not be read" "$out"
+assert_contains "and the denial says the reset time was not read" "could not read the reset time" "$out"
 assert_not_contains "and gives no countdown from a guess" "blocked for" "$out"
 assert_eq "and the denial is still valid JSON" "ok" \
   "$(printf '%s' "$out" | python3 -c 'import json,sys; json.load(sys.stdin); print("ok")' 2>/dev/null)"
@@ -788,15 +798,39 @@ assert_eq "a corrupt reset ends the turn instead of resuming it" "" \
 if [ $(( $(date +%s) - s )) -lt 5 ]; then ok "and it does not wait on it"
 else bad "and it does not wait on it" "<5s" "$(( $(date +%s) - s ))s"; fi
 
-# An estimated reset is a guess, not a reading. Restarting when that guess comes
-# due would send the model back to work with the window still at 96%, so the
-# clock coming round is not enough on its own.
+# The guess is a whole window past the reading that could not be parsed, and the
+# window it belongs to began at or before that reading — so the real reset has
+# certainly happened by the time the guess comes due. It is an upper bound, and
+# an upper bound is the one thing a release can be built on. The gate already
+# released on it; the wait refusing to meant an estimated pause was lifted with
+# no turn left open to restart, which stopped the job for good. Both follow it
+# now.
 new_home
 probe_with 96 "resets in 12 minutes"
 bash "$KEEPER" check >/dev/null 2>&1
 set_field reset_epoch "$(( $(date +%s) - 10 ))"
-assert_eq "an estimated reset never restarts a turn on its own clock" "" \
-  "$(bash "$KEEPER" stop </dev/null 2>/dev/null)"
+assert_contains "an estimated reset restarts the turn once its bound has passed" \
+  '"decision":"block"' "$(bash "$KEEPER" stop </dev/null 2>/dev/null)"
+
+new_home
+probe_with 96 "resets in 12 minutes"
+bash "$KEEPER" check >/dev/null 2>&1
+badge=$(bash "$STATUSLINE" 2>/dev/null)
+assert_contains "a paused badge marks a guessed countdown as guessed" "BLOCKED ~" "$badge"
+
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+assert_not_contains "and marks a measured one as measured" "BLOCKED ~" \
+  "$(bash "$STATUSLINE" 2>/dev/null)"
+
+new_home
+probe_with 96 "resets in 12 minutes"
+out=$(bash "$KEEPER" check 2>/dev/null)
+assert_contains "the denial does not order a duration it withheld" \
+  "for how long if this message gives a duration" "$out"
+assert_contains "and forbids inventing one" "none to be estimated" "$out"
+
 
 # Disabling the guard mid-wait, deleting its state, or hitting the cap are all
 # reasons to stop waiting — none of them is a rollover, so none may resume.

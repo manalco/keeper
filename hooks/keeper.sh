@@ -91,7 +91,7 @@ case "$RESUME_GRACE" in ''|*[!0-9]*) RESUME_GRACE=60 ;; esac
 # unreadable and the duration never is — ordering a model to state a time it was
 # not given is ordering it to invent one. And it is written once, so the two
 # denials cannot drift apart, which they already had.
-STOP_INSTRUCTIONS="Stop now: no retries, no other tools, no working around this in prose. Say in one line that Keeper paused the session and for how long. End the turn there. Keeper resumes this work by itself once the window rolls over, and the restart arrives on its own as KEEPER RESUME, carrying on from exactly here. The user does not need to reply or re-ask for that to happen, so do not ask them to."
+STOP_INSTRUCTIONS="Stop now: no retries, no other tools, no working around this in prose. Say in one line that Keeper paused the session, and for how long if this message gives a duration. End the turn there. Keeper resumes this work by itself once the window rolls over, and the restart arrives on its own as KEEPER RESUME, carrying on from exactly here. The user does not need to reply or re-ask for that to happen, so do not ask them to."
 
 mkdir -p "$KEEPER_HOME" 2>/dev/null
 
@@ -401,8 +401,26 @@ print(int(target.timestamp()), label)
   # The label carries only minutes, and a reading taken moments after a rollover
   # legitimately sits a whole window out, so the ceiling needs slack — without it
   # a perfectly good reset time was rejected as nonsense.
+  # Read before guessing: the guess wants to know whether an earlier one is still
+  # standing.
+  load_state || true
   if [ -z "$epoch" ] || [ "$epoch" -le "$now" ] || [ $((epoch - now)) -gt $((WINDOW_SECONDS + 300)) ]; then
-    epoch=$((now + 900))
+    # A whole window, not fifteen minutes. The number is a guess either way, and
+    # the only honest thing a guess can do here is bound the wait: no window
+    # outlasts its own length, so this cannot pause anything forever, and it
+    # cannot end a pause early either. Fifteen minutes did exactly that — it
+    # handed the tools back with the account still over the limit, and until then
+    # it was counted down at the user as if somebody had measured it.
+    # Anchored to the reading that first failed to parse, not recomputed from
+    # this one. Probing continues every ninety seconds at this level, so a bound
+    # recomputed each time is pushed further out than the time that has passed —
+    # it never arrives, and the one clock that could end a pause built on an
+    # unreadable reset recedes forever.
+    if [ "${S_est:-0}" = "1" ] && [ -n "$S_reset" ] && [ "$S_reset" -gt "$now" ]; then
+      epoch="$S_reset"
+    else
+      epoch=$((now + WINDOW_SECONDS))
+    fi
     label=""
     est=1
   fi
@@ -412,7 +430,6 @@ print(int(target.timestamp()), label)
   # flagging it as a failure raised an alarming badge over a working guard.
   rm -f "$PROBE_ERR" 2>/dev/null
 
-  load_state || true
   write_state "$pct" "$epoch" "$label" "${S_blocked:-0}" "$est"
 }
 
@@ -498,6 +515,20 @@ disarm_timer() {
 # last-key-wins parsers — and inject text into the model's context besides.
 deny() {
   printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"%s"}}\n' "$1"
+}
+
+# How long the pause has left, or an admission that nobody knows. A guessed reset
+# time reported as a duration is worse than no duration at all: it reads as a
+# measurement, and a pause with most of a window still to run announced fourteen
+# minutes, which is what sent everyone looking for a stale cache. Saying no
+# number is given is not enough on its own either — a model told to report a
+# duration will produce one from whatever it has, so it is told not to.
+blocked_for() {
+  if [ "${S_est:-0}" = "1" ]; then
+    printf 'until the 5-hour session window rolls over. Keeper could not read the reset time, so there is no countdown here and none to be estimated'
+  else
+    printf 'for %s%s' "$(human_left "${1:-0}")" "$(until_phrase)"
+  fi
 }
 
 until_phrase() { # "until 3:50pm" when the label is trustworthy, else silence
@@ -619,10 +650,6 @@ do_stop() {
     notify "Keeper released the pause — resuming the interrupted work."
     resume_answer
   fi
-  # An estimated reset is a 15-minute placeholder, not a reading. Waiting it out
-  # and then sending the model back to work would restart the job with the window
-  # possibly still full — the one outcome worse than stopping too early.
-  [ "${S_est:-0}" = "1" ] && exit 0
 
   # A Stop hook that continues its own continuation loops forever and burns the
   # window it exists to protect. Two things prevent it, both on this side: the
@@ -665,10 +692,6 @@ do_stop() {
     # Asked before the pause itself, because a guard switched off mid-wait must
     # end the turn quietly whatever the state file says next.
     [ "$(enabled)" = "1" ] || break
-    # An estimated reset is a placeholder, and the forced read below happens at
-    # the moment the reset clause is least likely to parse, so this is re-asked
-    # every pass rather than only on the way in.
-    [ "${S_est:-0}" = "1" ] && break
     now=$(date +%s)
     if [ "$S_blocked" != "1" ]; then
       # The pause is one flag for the whole account, so any other session's tool
@@ -813,7 +836,7 @@ do_check() {
     fi
     arm_timer "$left" "$S_reset"
     mark_pending 2>/dev/null
-    deny "KEEPER PAUSE ACTIVE. Session window at ${S_pct:-unknown}% (limit ${th}%). All tools stay blocked for $(human_left "$left")$(until_phrase). $STOP_INSTRUCTIONS"
+    deny "KEEPER PAUSE ACTIVE. Session window at ${S_pct:-unknown}% (limit ${th}%). All tools stay blocked $(blocked_for "$left"). $STOP_INSTRUCTIONS"
     exit 0
   fi
 
@@ -827,7 +850,7 @@ do_check() {
     arm_timer "$left" "${S_reset:-0}"
     notify "Session window at ${S_pct}% — work paused$(until_phrase)."
     mark_pending 2>/dev/null
-    deny "KEEPER TRIPPED at ${S_pct}% of the 5-hour session window (limit ${th}%). All tools are now blocked for $(human_left "$left")$(until_phrase). $STOP_INSTRUCTIONS"
+    deny "KEEPER TRIPPED at ${S_pct}% of the 5-hour session window (limit ${th}%). All tools are now blocked $(blocked_for "$left"). $STOP_INSTRUCTIONS"
     exit 0
   fi
   exit 0

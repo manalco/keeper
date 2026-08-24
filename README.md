@@ -1,7 +1,7 @@
 # Keeper
 
 [![status](https://img.shields.io/badge/status-active-108C4A?style=flat-square)](#)
-[![self--check](https://img.shields.io/badge/self--check-151%2F151%20passing-2E7D32?style=flat-square)](#self-check)
+[![self--check](https://img.shields.io/badge/self--check-165%2F165%20passing-2E7D32?style=flat-square)](#self-check)
 [![token cost](https://img.shields.io/badge/token%20cost-~69%20tokens%2Fsession-1565C0?style=flat-square)](#what-it-costs)
 [![probe](https://img.shields.io/badge/probe-0%20API%20calls-1565C0?style=flat-square)](#how-it-works)
 [![threshold](https://img.shields.io/badge/default%20threshold-95%25-D97706?style=flat-square)](#configuration)
@@ -180,10 +180,31 @@ These properties matter more than the mechanism:
   99% behind, and it zeroes `fetched_at` precisely so nothing trusts the number.
   Restarting on it would drive the work into the wall the pause was holding it
   back from.
-- **An estimated reset never resumes.** When the probe cannot parse the reset
-  clause it stores a placeholder fifteen minutes out. Waiting that out and then
-  resuming would send the model back to work with the window still full, so a
-  reading marked `~` holds nothing open.
+- **A reset time nobody could read is a bound, not a time.** When the probe
+  cannot parse the reset clause it keeps the percentage, which parsed fine, and
+  records the reset as estimated. That estimate is a whole window past the
+  reading, because the window it belongs to began at or before the reading and is
+  five hours long — so the real reset has certainly happened by the time the
+  estimate comes due. An upper bound is the one thing a release can be built on.
+
+  Fifteen minutes was the old placeholder, and it had none of that property. The
+  denial counted down from it, so a pause with most of a window still to run
+  announced fourteen minutes and sent everyone looking for a stale cache. The
+  gate released on it, handing the tools back with the account still over the
+  limit. And the wait refused to hold a turn at all while the reset was
+  estimated — correctly, since resuming on that placeholder would have restarted
+  the work against a full window, but it left an estimated pause with no way
+  back: not lifted by a clock nobody trusted, and no turn open when the reading
+  finally lifted it.
+
+  Now nothing counts down from a guess. The denial says the reset time could not
+  be read and tells the model not to estimate one; the badge marks a guessed
+  countdown with the same `~` the rest of the display uses; the estimate is
+  anchored to the reading that first failed to parse rather than recomputed on
+  every probe, since a bound that moves further out than time passes never
+  arrives. What ends an estimated pause is a reading below the threshold — the
+  part of the probe that was never a guess — or the bound itself, in both the
+  gate and the wait.
 - **One session is held, not all of them.** The pause is recorded once for the
   account, so every open window sees it. Without an exclusive hold each would
   freeze its own turn and be force-resumed at the rollover — N model turns
@@ -267,7 +288,7 @@ Files:
 |---|---|
 | `~/.claude/skills/keeper/hooks/keeper.sh` | probe, gate, session block, the held-open turn, config |
 | `~/.claude/skills/keeper/hooks/keeper-statusline.sh` | `[KEEPER:NN%]` badge |
-| `~/.claude/skills/keeper/hooks/keeper-selfcheck.sh` | 151 offline assertions |
+| `~/.claude/skills/keeper/hooks/keeper-selfcheck.sh` | 165 offline assertions |
 | `~/.claude/skills/keeper/SKILL.md` | the control-surface skill |
 | `~/.claude/.keeper-state` | cached reading (`pct`, `reset_epoch`, `blocked`) |
 | `~/.claude/.keeper-config` | `threshold=95`, `enabled=1` |

@@ -37,7 +37,7 @@ running. This skill is the control surface: reading state and changing settings.
   resumes on its own instead of waiting for the user to type. Waiting is a
   sleeping shell and costs nothing, and it refreshes the reading as it goes, so
   an early rollover ends the wait instead of sleeping through it. Only a real
-  rollover restarts the turn: an estimated reset time, a guard switched off
+  rollover restarts the turn: a guard switched off
   mid-wait, or an unreadable state file all end the turn quietly instead.
 - The statusline badge shows `[KEEPER:33%]`, coloured against the configured
   threshold, and `[KEEPER:96% BLOCKED 2h14m]` while paused. Suffixes are graded:
@@ -105,6 +105,7 @@ hook to be allowed to run for the length of the wait (`timeout: 18420` in
 settings); if the harness kills it earlier, the pause still releases but the work
 waits for the user's next message. A restart is only ever delivered at the end of
 a turn, so a session whose turn already ended without being held waits too, and
-an estimated reset time restarts nothing at all. And a subagent already mid-tool-call
+a reset time that could not be read gives no countdown at all — the pause ends
+on a reading below the threshold, or on a bound one window out. And a subagent already mid-tool-call
 finishes that call — the block lands on its next one, which is part of why the
 default threshold leaves 5% of headroom rather than sitting at 99%.

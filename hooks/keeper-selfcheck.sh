@@ -36,7 +36,16 @@ cleanup() {
       pid="${pid//[!0-9]/}"
       [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && kill "$pid" 2>/dev/null
     fi
-    case "$h" in /*keeper-selfcheck.*) rm -rf "$h" ;; esac
+    # The recorded pid is not always the only one: a case that replaces a timer
+    # record, or one whose sleeper outlived its file, leaves a two-hour process
+    # behind. Enough runs of that filled the process table and every fork in the
+    # shell started failing.
+    case "$h" in
+      /*keeper-selfcheck.*)
+        for stray in $(pgrep -f "keeper-timer.*$h" 2>/dev/null); do kill "$stray" 2>/dev/null; done
+        rm -rf "$h"
+        ;;
+    esac
   done
 }
 trap cleanup EXIT
@@ -114,6 +123,11 @@ export KEEPER_NO_REFRESH=1
 # The grace before a restart is a minute in real life. Cases that need to observe
 # it set their own; the rest must not sit through it.
 export KEEPER_RESUME_GRACE=2
+# The gate holds a call instead of denying it, which every case written before
+# the hold existed would sit through. Zero restores the old deny-on-the-spot
+# behaviour, so those cases keep measuring exactly what they always measured;
+# the hold has its own section, and each case there sets its own cap.
+export KEEPER_WAIT_CAP=0
 
 [ -x "$KEEPER" ] || { echo "keeper.sh missing or not executable: $KEEPER"; exit 1; }
 
@@ -318,10 +332,15 @@ assert_contains "blocked badge renders red" $'\033[38;5;160m' "$badge"
 if printf '%s' "$badge" | grep -qE '[0-9]+h[0-9]+m|[0-9]+m'; then ok "blocked badge counts down"
 else bad "blocked badge counts down" "an h/m countdown" "$badge"; fi
 
-# An idle session past its reset would otherwise show a red 0m countdown forever,
-# since only a tool call can clear the flag.
+# Past the reset the badge keeps saying BLOCKED and drops the countdown. It used
+# to clear the whole badge, because only a tool call could clear the flag and an
+# idle session would have sat on a red 0m countdown forever. A held call clears
+# it now, and while one waits out the grace the badge is the only thing that says
+# why the session is frozen — the model is not talking, and no denial was issued.
 set_field reset_epoch "$(( $(date +%s) - 60 ))"
-assert_not_contains "stale block clears itself in the badge" "BLOCKED" "$(bash "$STATUSLINE" 2>/dev/null)"
+badge=$(bash "$STATUSLINE" 2>/dev/null)
+assert_contains "a stale block still says BLOCKED" "BLOCKED" "$badge"
+assert_contains "a stale block offers no countdown" "BLOCKED]" "$badge"
 
 # Colors that ignore the configured threshold stop meaning "near the wall".
 new_home
@@ -1059,6 +1078,243 @@ bash "$KEEPER" check >/dev/null 2>&1
 set_field reset_epoch "$(( $(date +%s) + 30 ))"
 assert_contains "a pause under a minute is not reported as 0m" "<1m" \
   "$(bash "$KEEPER" check 2>/dev/null)"
+
+# --- the hold ----------------------------------------------------------------
+echo "hold:"
+# A denial ends the agent that receives it, and an agent so ended is not
+# resumable: nothing re-invokes a subagent, and the Stop hook restarts exactly
+# one turn per pause for the whole account. Holding the call instead costs a
+# sleeping shell and no tokens, and the tool call itself is the continuation.
+new_home
+probe_with 96 "$(clause_in 2)"
+set_field reset_epoch "$(( $(date +%s) + 2 ))"
+t0=$(date +%s)
+out=$(KEEPER_WAIT_CAP=30 bash "$KEEPER" check 2>/dev/null); rc=$?
+t1=$(date +%s)
+assert_eq "over threshold holds the call instead of denying" "" "$out"
+assert_eq "a released hold lets the tool run" "0" "$rc"
+if [ $(( t1 - t0 )) -ge 1 ]; then ok "the hold actually waits"
+else bad "the hold actually waits" ">=1s" "$(( t1 - t0 ))s"; fi
+assert_eq "the rollover clears the pause" "0" "$(state blocked)"
+# An explicit allow decision bypasses the permission system outright, so a held
+# `rm -rf` would come back auto-approved. The hold ends with a bare exit 0.
+assert_not_contains "the hold never returns an allow decision" "allow" "$out"
+# Only work that was actually abandoned may leave a record behind: a restart
+# owed to a call that carried on hands the user work nobody interrupted.
+assert_eq "a released hold records no interrupted work" "0" \
+  "$([ -f "$KEEPER_HOME/.keeper-pending" ] && echo 1 || echo 0)"
+
+# The reset time is a prediction. A reading that comes back under the threshold
+# is the window reporting its own rollover, and it must end the hold hours
+# before the predicted moment rather than sit out a window that already turned.
+new_home
+probe_with 96 "$(clause_in 2)"
+set_field reset_epoch "$(( $(date +%s) + 120 ))"
+( sleep 2; probe_with 10 "$(clause_in 4)" ) &
+t0=$(date +%s)
+out=$(KEEPER_WAIT_CAP=60 bash "$KEEPER" check 2>/dev/null)
+t1=$(date +%s)
+wait
+assert_not_contains "an early rollover releases a held call" "deny" "$out"
+if [ $(( t1 - t0 )) -lt 30 ]; then ok "the early rollover ends the wait"
+else bad "the early rollover ends the wait" "<30s" "$(( t1 - t0 ))s"; fi
+assert_eq "the new window's reading is kept, not zeroed" "10" "$(state pct)"
+
+# The escape hatch has to reach a held call, or a pause raised from another
+# terminal leaves every waiter sitting there until the cap.
+new_home
+probe_with 96 "$(clause_in 2)"
+( sleep 2; bash "$KEEPER" threshold 99 >/dev/null 2>&1 ) &
+t0=$(date +%s)
+out=$(KEEPER_WAIT_CAP=60 bash "$KEEPER" check 2>/dev/null)
+t1=$(date +%s)
+wait
+assert_not_contains "raising the threshold frees a held call" "deny" "$out"
+if [ $(( t1 - t0 )) -lt 30 ]; then ok "the raised threshold ends the wait"
+else bad "the raised threshold ends the wait" "<30s" "$(( t1 - t0 ))s"; fi
+
+new_home
+probe_with 96 "$(clause_in 2)"
+( sleep 2; bash "$KEEPER" off >/dev/null 2>&1 ) &
+t0=$(date +%s)
+out=$(KEEPER_WAIT_CAP=60 bash "$KEEPER" check 2>/dev/null)
+t1=$(date +%s)
+wait
+assert_eq "switching the guard off frees a held call" "" "$out"
+if [ $(( t1 - t0 )) -lt 30 ]; then ok "the disabled guard ends the wait"
+else bad "the disabled guard ends the wait" "<30s" "$(( t1 - t0 ))s"; fi
+
+# The cap is what keeps the guard fail-closed: a hook the harness cancels
+# contributes no decision at all and the tool then runs, so Keeper has to answer
+# first, on its own terms.
+new_home
+probe_with 96 "$(clause_in 2)"
+t0=$(date +%s)
+out=$(KEEPER_WAIT_CAP=2 bash "$KEEPER" check 2>/dev/null)
+t1=$(date +%s)
+assert_contains "a capped hold falls back to the denial" '"permissionDecision":"deny"' "$out"
+if [ $(( t1 - t0 )) -ge 2 ]; then ok "the cap is waited out before denying"
+else bad "the cap is waited out before denying" ">=2s" "$(( t1 - t0 ))s"; fi
+assert_eq "only a capped hold records interrupted work" "1" \
+  "$([ -f "$KEEPER_HOME/.keeper-pending" ] && echo 1 || echo 0)"
+assert_contains "the capped denial still says to end the turn" "End the turn" "$out"
+
+# A fan-out of subagents all reach the gate at once. Every one of them has to be
+# released — a hold that admitted one waiter and denied the rest would evaporate
+# under exactly the case it exists for.
+new_home
+probe_with 96 "$(clause_in 2)"
+set_field reset_epoch "$(( $(date +%s) + 3 ))"
+a=$(KEEPER_WAIT_CAP=40 bash "$KEEPER" check 2>/dev/null) &
+pa=$!
+b=$(KEEPER_WAIT_CAP=40 bash "$KEEPER" check 2>/dev/null) &
+pb=$!
+c=$(KEEPER_WAIT_CAP=40 bash "$KEEPER" check 2>/dev/null) &
+pc=$!
+sleep 1
+assert_eq "a held call does not take the stop hold" "0" \
+  "$([ -d "$KEEPER_HOME/.keeper-hold" ] && echo 1 || echo 0)"
+wait $pa $pb $pc
+count=$(( $(KEEPER_WAIT_CAP=0 bash "$KEEPER" check 2>/dev/null | grep -c 'deny') ))
+assert_eq "parallel holds are all released" "0" "$count"
+
+# The deadlock-breaker must never be delayed by the wait: while the gate denies,
+# the command that would lift it is denied too, and a corrupt reset time is the
+# one state that never resolves itself.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+set_field reset_epoch 0
+t0=$(date +%s)
+out=$(KEEPER_WAIT_CAP=60 bash "$KEEPER" check 2>/dev/null)
+t1=$(date +%s)
+assert_not_contains "a corrupt reset time never holds" "deny" "$out"
+if [ $(( t1 - t0 )) -lt 3 ]; then ok "the deadlock-breaker releases at once"
+else bad "the deadlock-breaker releases at once" "<3s" "$(( t1 - t0 ))s"; fi
+
+# Filtered like every other number that arrives from outside. A cap that fell to
+# zero on a typo would put the old kill-the-agent behaviour back without a word.
+new_home
+probe_with 96 "$(clause_in 2)"
+set_field reset_epoch "$(( $(date +%s) + 2 ))"
+out=$(KEEPER_WAIT_CAP="not a number" bash "$KEEPER" check 2>/dev/null)
+assert_eq "a malformed cap falls back to holding" "" "$out"
+
+# A percentage over the threshold sitting next to a reset time nobody can read
+# is a corrupt state, not a pause with an end. Holding on it would wait for a
+# moment that never comes, so the call goes through — the same rule the rest of
+# the guard follows for state it cannot trust. What it must not do is announce a
+# rollover that never happened.
+new_home
+probe_with 96 "$(clause_in 2)"
+set_field reset_epoch 0
+t0=$(date +%s)
+out=$(KEEPER_WAIT_CAP=60 bash "$KEEPER" check 2>/dev/null)
+t1=$(date +%s)
+assert_eq "an unreadable reset lets the tripping call through" "" "$out"
+if [ $(( t1 - t0 )) -lt 3 ]; then ok "an unreadable reset is not waited on"
+else bad "an unreadable reset is not waited on" "<3s" "$(( t1 - t0 ))s"; fi
+assert_eq "an unreadable reset leaves no pause behind" "0" "$(state blocked)"
+
+# An estimated reset has no countdown to offer, but it still bounds the wait, and
+# the denial at the cap has to say that rather than invent a duration.
+new_home
+probe_with 96 "resets never"
+assert_eq "an unreadable clause is marked estimated" "1" "$(state reset_est)"
+out=$(KEEPER_WAIT_CAP=2 bash "$KEEPER" check 2>/dev/null)
+assert_contains "a capped hold on an estimate offers no countdown" "no countdown" "$out"
+
+# The state file going away mid-hold is the ambiguous case the whole file
+# resolves the same way: let the work through rather than hold it on nothing.
+new_home
+probe_with 96 "$(clause_in 2)"
+( sleep 2; rm -f "$KEEPER_HOME/.keeper-state" ) &
+t0=$(date +%s)
+out=$(KEEPER_WAIT_CAP=60 bash "$KEEPER" check 2>/dev/null)
+t1=$(date +%s)
+wait
+assert_eq "losing the state mid-hold frees the call" "" "$out"
+if [ $(( t1 - t0 )) -lt 30 ]; then ok "the lost state ends the wait"
+else bad "the lost state ends the wait" "<30s" "$(( t1 - t0 ))s"; fi
+
+# The timer announces a rollover to a session that stopped. A held call has not
+# stopped, and arming one per pass per waiter piled up detached five-hour
+# sleepers that `keeper.sh off` could not kill, since only the last was recorded.
+new_home
+probe_with 96 "$(clause_in 2)"
+set_field reset_epoch "$(( $(date +%s) + 3 ))"
+KEEPER_WAIT_CAP=40 bash "$KEEPER" check >/dev/null 2>&1 &
+p1=$!
+KEEPER_WAIT_CAP=40 bash "$KEEPER" check >/dev/null 2>&1 &
+p2=$!
+sleep 2
+assert_eq "a held call arms no timer" "0" \
+  "$([ -f "$KEEPER_HOME/.keeper-timer.pid" ] && echo 1 || echo 0)"
+wait $p1 $p2
+# The denial at the cap is the one path that does leave the session stopped, so
+# that is where the announcement belongs.
+new_home
+probe_with 96 "$(clause_in 2)"
+KEEPER_WAIT_CAP=1 bash "$KEEPER" check >/dev/null 2>&1
+assert_eq "a capped hold arms the timer" "1" \
+  "$([ -f "$KEEPER_HOME/.keeper-timer.pid" ] && echo 1 || echo 0)"
+
+# Arming is check-then-act, and callers arrive together: a fan-out all denying at
+# the cap, or several sessions meeting one rollover. Each spawned its own
+# five-hour sleeper and only the last was recorded, so the rest could never be
+# killed — not by `disarm_timer`, not by `keeper.sh off`.
+new_home
+probe_with 96 "$(clause_in 2)"
+for _ in 1 2 3 4; do KEEPER_WAIT_CAP=0 bash "$KEEPER" check >/dev/null 2>&1 & done
+wait
+assert_eq "arming at once leaves exactly one timer" "1" \
+  "$(ps -eo command 2>/dev/null | grep -c "[k]eeper-timer.*$KEEPER_HOME")"
+
+# Clearing a reading rewrites the file once. The fields it does not touch have to
+# survive that, or a release quietly loses the reset time it just released on.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+label_before=$(state reset_human)
+set_field reset_epoch "$(( $(date +%s) - 600 ))"
+KEEPER_WAIT_CAP=0 bash "$KEEPER" check >/dev/null 2>&1
+assert_eq "a release keeps the fields it does not clear" "$label_before" "$(state reset_human)"
+assert_eq "a release clears the reading in one pass" "0-0-0" \
+  "$(state blocked)-$(state pct)-$(state fetched_at)"
+
+# People wire the hook from project settings as often as from user settings, and
+# a warning that reads only one of them is silent for everyone who used another.
+new_home
+probe_with 40 "$(clause_in 2)"
+mkdir -p "$KEEPER_HOME/proj/.claude"
+cat > "$KEEPER_HOME/proj/.claude/settings.json" <<'JSON'
+{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"bash \"$HOME/.claude/skills/keeper/hooks/keeper.sh\" check"}]}]}}
+JSON
+assert_contains "project settings are checked for the timeout too" "timeout" \
+  "$(KEEPER_WAIT_CAP=18300 CLAUDE_PROJECT_DIR="$KEEPER_HOME/proj" KEEPER_SETTINGS=/nonexistent bash "$KEEPER" status 2>/dev/null)"
+
+# Project directories have spaces in them all the time, and a path that splits
+# into two unreadable ones warns about nothing at all.
+mkdir -p "$KEEPER_HOME/my proj/.claude"
+cp "$KEEPER_HOME/proj/.claude/settings.json" "$KEEPER_HOME/my proj/.claude/settings.json"
+assert_contains "a project path with a space is still checked" "timeout" \
+  "$(KEEPER_WAIT_CAP=18300 CLAUDE_PROJECT_DIR="$KEEPER_HOME/my proj" KEEPER_SETTINGS=/nonexistent bash "$KEEPER" status 2>/dev/null)"
+
+# The cap only works if the harness lets the hook run that long. A missing
+# timeout in the wiring cancels the hook mid-hold, and a cancelled PreToolUse
+# hook contributes no decision — the tool runs, unguarded, at 96%.
+new_home
+probe_with 40 "$(clause_in 2)"
+cat > "$KEEPER_HOME/settings.json" <<'JSON'
+{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"bash \"$HOME/.claude/skills/keeper/hooks/keeper.sh\" check"}]}]}}
+JSON
+assert_contains "status names an unwired hold" "timeout" \
+  "$(KEEPER_WAIT_CAP=18300 KEEPER_SETTINGS="$KEEPER_HOME/settings.json" bash "$KEEPER" status 2>/dev/null)"
+cat > "$KEEPER_HOME/settings.json" <<'JSON'
+{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"bash \"$HOME/.claude/skills/keeper/hooks/keeper.sh\" check","timeout":18420}]}]}}
+JSON
+assert_not_contains "a wired hold is not reported as a problem" "unwired" \
+  "$(KEEPER_WAIT_CAP=18300 KEEPER_SETTINGS="$KEEPER_HOME/settings.json" bash "$KEEPER" status 2>/dev/null)"
 
 # --- misc --------------------------------------------------------------------
 echo "misc:"

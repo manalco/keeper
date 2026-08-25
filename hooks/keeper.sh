@@ -82,6 +82,22 @@ case "$RESUME_GRACE_MAX" in ''|*[!0-9]*) RESUME_GRACE_MAX=300 ;; esac
 case "$RESUME_GRACE" in ''|*[!0-9]*) RESUME_GRACE=60 ;; esac
 [ "$RESUME_GRACE" -gt "$RESUME_GRACE_MAX" ] && RESUME_GRACE="$RESUME_GRACE_MAX"
 
+# How long the gate may hold a tool call before it gives up and denies it.
+# It has to stay below the PreToolUse timeout in settings.json: a hook the
+# harness cancels contributes no decision at all, and the tool then runs — a
+# whole window handed out silently at 96%, which is the one failure this guard
+# cannot come back from. Answering first, on Keeper's own terms, is what keeps
+# it fail-closed. The number matches the cap the held turn already uses: a
+# window plus slack, because a pause can begin anywhere in one.
+# Zero restores the old deny-on-the-spot behaviour, which is the escape hatch
+# if holding ever proves worse than stopping.
+WAIT_CAP="${KEEPER_WAIT_CAP:-18300}"
+case "$WAIT_CAP" in ''|*[!0-9]*) WAIT_CAP=18300 ;; esac
+# The gate wakes this often while it waits, so a threshold raised or a guard
+# switched off from another terminal frees every held call within one span
+# rather than at the original reset time.
+WAIT_CHUNK=15
+
 # The denial is the only instruction the model gets, and everything after the
 # numbers is what decides whether the work restarts. It says end the turn,
 # because the restart is delivered to a turn that has ended and there is nothing
@@ -233,6 +249,24 @@ write_state() { # pct reset_epoch reset_human blocked reset_est
 # sed replacing a line that is not there succeeded while persisting nothing, so a
 # state file missing `blocked=` never recorded the pause — which made the release
 # path, reachable only while blocked=1, dead code. Append when absent.
+# Clearing a reading is one rewrite, not three. Separate writes left the file
+# readable but half-updated in between, and with a fan-out of held calls
+# releasing together a probe writing between them could be half-overwritten: a
+# fabricated pct=0 beside a genuine fresh timestamp, which reads as a measured
+# empty window and is believed for a whole refresh interval.
+clear_reading() {
+  [ -n "$REFUSED" ] && return 0
+  [ -f "$STATE" ] || return 0
+  local out="" line
+  while IFS= read -r line; do
+    case "$line" in
+      blocked=*|pct=*|fetched_at=*) ;;
+      *) out="$out$line"$'\n' ;;
+    esac
+  done < "$STATE"
+  printf '%sblocked=0\npct=0\nfetched_at=0\n' "$out" | atomic_write "$STATE"
+}
+
 set_field() { # key value
   [ -n "$REFUSED" ] && return 0
   [ -f "$STATE" ] || return 0
@@ -480,13 +514,28 @@ arm_timer() {
   # denying, and recorded a dead pid so the next call did it all again.
   [ "$left" -lt 1 ] && return 0
   local want="$2"
+  # Checking the record and then spawning is two steps, and callers arrive
+  # together — a fan-out of denials at the cap, several sessions meeting the same
+  # rollover. Each found no live timer, each spawned one, and only the last could
+  # be recorded: the rest became five-hour sleepers that `disarm_timer` and
+  # `keeper.sh off` had no pid for, and that ended by deleting whatever timer
+  # record existed by then. One claim at a time closes it.
+  if ! mkdir "$TIMER.lock" 2>/dev/null; then
+    # A claim left behind by a process killed mid-arm must not cost every later
+    # rollover its announcement.
+    [ $(( $(date +%s) - $(mtime "$TIMER.lock") )) -lt 60 ] && return 0
+    rm -rf "$TIMER.lock" 2>/dev/null
+    mkdir "$TIMER.lock" 2>/dev/null || return 0
+  fi
   if [ -f "$TIMER" ]; then
     local pid epoch
     read -r pid epoch < "$TIMER" 2>/dev/null || true
     pid="${pid//[!0-9]/}"; epoch="${epoch//[!0-9]/}"
     # A surviving pid file after a reboot can name an unrelated process, so the
     # recorded target is checked too, not just liveness.
-    if [ -n "$pid" ] && [ "$epoch" = "$want" ] && kill -0 "$pid" 2>/dev/null; then return 0; fi
+    if [ -n "$pid" ] && [ "$epoch" = "$want" ] && kill -0 "$pid" 2>/dev/null; then
+      rm -rf "$TIMER.lock" 2>/dev/null; return 0
+    fi
     disarm_timer
   fi
   # Data passed as arguments, never spliced into the source text: a single quote
@@ -497,7 +546,11 @@ arm_timer() {
     elif command -v notify-send >/dev/null 2>&1; then
       notify-send "Keeper" "Session window reset — Keeper released the pause." >/dev/null 2>&1
     fi; rm -f "$2"' keeper-timer "$left" "$TIMER" >/dev/null 2>&1 </dev/null &
-  printf '%s %s\n' "$!" "$want" > "$TIMER" 2>/dev/null
+  # Plain `>` truncates in place, so two callers arming at once interleaved into
+  # a mangled pid — which the next read discarded, disarmed and armed again,
+  # turning a race into a pile of orphans.
+  printf '%s %s\n' "$!" "$want" | atomic_write "$TIMER" 2>/dev/null
+  rm -rf "$TIMER.lock" 2>/dev/null
 }
 
 disarm_timer() {
@@ -568,11 +621,11 @@ reading_cleared() {
 # `status` for an account nowhere near it — a lie that outlives the next probe if
 # the probe is broken.
 release() { # [keep]  — keep: the cached reading is the new window's, not the old
-  set_field blocked 0
   if [ "${1:-}" != "keep" ]; then
-    set_field pct 0
-    set_field fetched_at 0
+    clear_reading
     S_pct=0; S_fetched=0
+  else
+    set_field blocked 0
   fi
   disarm_timer
   S_blocked=0
@@ -786,6 +839,107 @@ do_stop() {
 }
 
 # ---------------------------------------------------------------------------
+# the hold — wait out the pause instead of ending the agent that hit it
+# ---------------------------------------------------------------------------
+# A denial ends the agent that receives it. The main session survives that, because
+# the Stop hook holds its turn open and restarts it; a subagent does not — nothing
+# re-invokes one, and the restart is granted once per pause for the whole account,
+# so a fan-out of ten loses nine. Holding the call answers all of them at once and
+# needs no resume protocol at all: when this returns, the tool call that was held
+# simply runs, and the work carries on from exactly where it stopped.
+#
+# Waiting costs a sleeping shell and no tokens. What it must never do is hand out
+# permission it was not asked for: the wait ends with a bare exit 0 and never with
+# an "allow" decision, which would bypass the permission system outright and
+# auto-approve whatever was held.
+hold_or_deny() { # left
+  local left="${1:-0}" now waited=0 wait_until nap
+  now=$(date +%s)
+  wait_until=$(( now + WAIT_CAP ))
+  while :; do
+    # Releasing on a bogus epoch too. Requiring epoch > 0 made a zero or missing
+    # value an unbreakable pause: every tool denied forever, including the one
+    # that would lift it, so the only way out was an external terminal. It is
+    # also the one state no amount of waiting resolves, so it is answered before
+    # the wait rather than after it.
+    # The clock striking is not the window turning over — for a short while after
+    # it the account still reports the window that just closed. Releasing on the
+    # instant handed out permission on a percentage nobody had measured yet, and
+    # the reading that landed a second later denied the same tool again. The gate
+    # is where every other session meets the rollover, so it waits out the same
+    # grace the held turn does.
+    if [ -z "$S_reset" ] || [ "$S_reset" -le 0 ]; then
+      release
+      # Not a rollover, and saying it was is how a corrupt state file gets read
+      # as a healthy one. The tool is let through because a guard that cannot
+      # say when a pause ends must not hold work forever — the file's rule for
+      # every ambiguous state is allow, and say so loudly.
+      [ "$waited" = "1" ] || notify "Keeper let the work through — the reset time is unreadable, so there is nothing to wait for."
+      maybe_refresh
+      exit 0
+    fi
+    if [ $(( left + RESUME_GRACE )) -le 0 ]; then
+      release
+      # One popup per rollover, not one per waiter: a fan-out of subagents all
+      # reach this within the same second, and the armed timer has announced it
+      # already for anyone who was watching.
+      [ "$waited" = "1" ] || notify "Session window reset — Keeper released the pause."
+      maybe_refresh
+      exit 0
+    fi
+    # The reset time is only a prediction, so it is not the only way out. A
+    # reading already under the threshold is the window reporting its own
+    # rollover, hours before the predicted moment, and holding against it wastes
+    # a window that already restarted. Raising the threshold from another
+    # terminal lands here too, since the comparison reads it live.
+    if reading_cleared; then
+      release keep
+      [ "$waited" = "1" ] || notify "Session window reset — Keeper released the pause."
+      maybe_refresh
+      exit 0
+    fi
+    # No timer here. It exists to announce the rollover to a session that
+    # stopped, and a held call has not stopped — it is waiting, and it announces
+    # its own release below. Arming it on every pass of every waiter spawned a
+    # detached five-hour sleeper per pass per waiter: N-1 of them unrecorded, so
+    # `keeper.sh off` could not kill them, and each ended by deleting whatever
+    # timer record it found by then.
+    [ "$now" -ge "$wait_until" ] && break
+    # Wake at the moment the release above would fire, or sooner. Sleeping
+    # straight to the reset time would sit through a guard switched off, an
+    # early rollover, and the cap alike.
+    nap=$(( left + RESUME_GRACE ))
+    [ "$nap" -gt "$WAIT_CHUNK" ] && nap="$WAIT_CHUNK"
+    [ "$nap" -gt $(( wait_until - now )) ] && nap=$(( wait_until - now ))
+    [ "$nap" -lt 1 ] && nap=1
+    sleep "$nap"
+    waited=1
+    # Nothing here is trusted across the sleep: the state file, the guard and the
+    # threshold may all have changed while this call was parked.
+    load_state || exit 0
+    [ "$(enabled)" = "1" ] || exit 0
+    # Released by another session, or by hand. There is no pause left to wait
+    # out, so the call this hook was asked about may simply run.
+    [ "$S_blocked" = "1" ] || exit 0
+    # A held call makes no tool calls of its own, so nothing else refreshes the
+    # reading it is waiting on. Every waiter asks; the TTL and the probe lock
+    # between them still allow only one probe.
+    maybe_refresh
+    now=$(date +%s)
+    if [ -n "$S_reset" ]; then left=$(( S_reset - now )); else left=0; fi
+  done
+  # Out of time before the window turned over. Now the denial is right — it is
+  # the only thing that still keeps the guard closed once this hook returns — and
+  # it re-enters the record-and-restart path that has always covered it.
+  # Now the session really does stop, so the rollover needs announcing to nobody
+  # in particular — which is what the timer is for.
+  arm_timer "$left" "$S_reset"
+  mark_pending 2>/dev/null
+  deny "KEEPER PAUSE ACTIVE at ${S_pct:-unknown}% of the 5-hour session window (limit $(threshold)%). Keeper held this call as long as it could and the window has not rolled over yet, so all tools stay blocked $(blocked_for "$left"). $STOP_INSTRUCTIONS"
+  exit 0
+}
+
+# ---------------------------------------------------------------------------
 # check — the PreToolUse gate
 # ---------------------------------------------------------------------------
 do_check() {
@@ -806,39 +960,7 @@ do_check() {
   now=$(date +%s); th=$(threshold)
   if [ -n "$S_reset" ]; then left=$(( S_reset - now )); else left=0; fi
 
-  if [ "$S_blocked" = "1" ]; then
-    # Releasing on a bogus epoch too. Requiring epoch > 0 made a zero or missing
-    # value an unbreakable pause: every tool denied forever, including the one
-    # that would lift it, so the only way out was an external terminal.
-    # The clock striking is not the window turning over — for a short while after
-    # it the account still reports the window that just closed. Releasing on the
-    # instant handed out permission on a percentage nobody had measured yet, and
-    # the reading that landed a second later denied the same tool again. The gate
-    # is where every other session meets the rollover, so it waits out the same
-    # grace the held turn does. A missing or bogus reset time still releases at
-    # once: that release exists to break a deadlock, and delaying it re-creates
-    # the deadlock it is for.
-    if [ -z "$S_reset" ] || [ "$S_reset" -le 0 ] || [ $(( left + RESUME_GRACE )) -le 0 ]; then
-      release
-      notify "Session window reset — Keeper released the pause."
-      maybe_refresh
-      exit 0
-    fi
-    # The reset time is only a prediction, so it is not the only way out. A
-    # reading already under the threshold is the window reporting its own
-    # rollover, hours before the predicted moment, and holding the pause against
-    # it denies every tool — including the one that would lift it.
-    if reading_cleared; then
-      release keep
-      notify "Session window reset — Keeper released the pause."
-      maybe_refresh
-      exit 0
-    fi
-    arm_timer "$left" "$S_reset"
-    mark_pending 2>/dev/null
-    deny "KEEPER PAUSE ACTIVE. Session window at ${S_pct:-unknown}% (limit ${th}%). All tools stay blocked $(blocked_for "$left"). $STOP_INSTRUCTIONS"
-    exit 0
-  fi
+  [ "$S_blocked" = "1" ] && hold_or_deny "$left"
 
   # An unknown percentage must not read as 0, but it must not block either:
   # blocking on corrupt state is the failure that cannot be undone from inside
@@ -847,16 +969,72 @@ do_check() {
 
   if [ "$S_pct" -ge "$th" ]; then
     set_field blocked 1
-    arm_timer "$left" "${S_reset:-0}"
+    S_blocked=1
     notify "Session window at ${S_pct}% — work paused$(until_phrase)."
-    mark_pending 2>/dev/null
-    deny "KEEPER TRIPPED at ${S_pct}% of the 5-hour session window (limit ${th}%). All tools are now blocked $(blocked_for "$left"). $STOP_INSTRUCTIONS"
-    exit 0
+    # The same wait every later call meets. Denying the call that trips the
+    # pause and holding the ones after it would end whichever agent happened to
+    # be first, which is the loss the hold exists to prevent.
+    hold_or_deny "$left"
   fi
   exit 0
 }
 
 # ---------------------------------------------------------------------------
+# The cap only holds if the harness lets the hook run that long. A PreToolUse
+# hook the harness cancels contributes no decision, and the tool then runs — so a
+# wiring without a timeout turns the hold into a ten-minute stall followed by an
+# unguarded call at 96%, which is worse than the denial it replaced. Nothing in
+# the hook can detect that from the inside, so the wiring is read instead, and
+# said out loud wherever Keeper already reports what is degraded.
+# The hook can be wired from user settings, project settings, or their .local
+# variants, and a warning that only reads one of them is silent for everyone who
+# used another — silence being indistinguishable from correct wiring. Nothing is
+# said when no keeper entry is found anywhere: a wiring passed by another route
+# is unreadable from here, and crying wolf at a correct setup is how a real
+# warning gets ignored.
+settings_paths() {
+  printf '%s\n' "${KEEPER_SETTINGS:-$KEEPER_HOME/settings.json}" \
+    "$KEEPER_HOME/settings.local.json"
+  # Spelled out rather than folded into the printf above with `${d:+...}`: that
+  # form drops its quoting and splits a project directory with a space in it into
+  # two unreadable paths, which is silence exactly where a warning was the point.
+  local d="${CLAUDE_PROJECT_DIR:-}"
+  [ -n "$d" ] && printf '%s\n' "$d/.claude/settings.json" "$d/.claude/settings.local.json"
+  return 0
+}
+hold_wiring() {
+  [ "$WAIT_CAP" -eq 0 ] && return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  local f
+  settings_paths | while IFS= read -r f; do
+    # A symlink here would have its target parsed instead. Nothing from the file
+    # is ever printed, so this cannot leak it, but the rest of the script
+    # refuses planted links on principle and this path is no different.
+    [ -L "$f" ] && continue
+    [ -f "$f" ] || continue
+    # Bounded like every other read here. A settings file bloated by a bad merge
+    # would otherwise be parsed in full on every session start.
+    [ "$(wc -c < "$f" 2>/dev/null || echo 0)" -gt 262144 ] && continue
+    python3 - "$f" "$WAIT_CAP" 2>/dev/null <<'WIRING'
+import json, sys
+try:
+    cfg = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+cap = int(sys.argv[2])
+for group in (cfg.get("hooks") or {}).get("PreToolUse") or []:
+    for h in group.get("hooks") or []:
+        cmd = h.get("command") or ""
+        if "keeper" in cmd and "check" in cmd:
+            t = h.get("timeout")
+            if not isinstance(t, int) or t <= cap:
+                print('Hold: unwired — the PreToolUse hook has no timeout above %ds, so a '
+                      'held call is cancelled mid-wait and then runs unguarded. Add '
+                      '"timeout": %d to it in %s.' % (cap, cap + 120, sys.argv[1]))
+WIRING
+  done
+}
+
 probe_error() { [ -z "$REFUSED" ] && [ -f "$PROBE_ERR" ] && head -c 120 "$PROBE_ERR" 2>/dev/null | tr -cd 'a-zA-Z0-9 ;:/.,()-'; }
 
 do_session_start() {
@@ -876,6 +1054,7 @@ do_session_start() {
     printf 'KEEPER ACTIVE — pause threshold %s%% of the 5-hour session window; reading it now.\n' "$th"
   fi
   [ -n "$err" ] && printf 'Keeper probe problem: %s — the reading may be stale, so say so if usage matters.\n' "$err"
+  hold_wiring
   printf 'If a tool comes back denied with a KEEPER message, that is the pause: stop at once, no retries and no working around it in prose, and tell the user when it releases.\n'
 }
 
@@ -906,6 +1085,7 @@ do_status() {
     printf 'Reading age: no reading yet\n'
   fi
   [ -n "$err" ] && printf 'Probe problem: %s\n' "$err"
+  hold_wiring
   if [ -f "$LASTCHECK" ]; then
     printf 'Gate last consulted: %ss ago\n' "$(( now - $(mtime "$LASTCHECK") ))"
   else

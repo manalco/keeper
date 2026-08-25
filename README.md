@@ -1,7 +1,7 @@
 # Keeper
 
 [![status](https://img.shields.io/badge/status-active-108C4A?style=flat-square)](#)
-[![self--check](https://img.shields.io/badge/self--check-165%2F165%20passing-2E7D32?style=flat-square)](#self-check)
+[![self--check](https://img.shields.io/badge/self--check-204%2F204%20passing-2E7D32?style=flat-square)](#self-check)
 [![token cost](https://img.shields.io/badge/token%20cost-~69%20tokens%2Fsession-1565C0?style=flat-square)](#what-it-costs)
 [![probe](https://img.shields.io/badge/probe-0%20API%20calls-1565C0?style=flat-square)](#how-it-works)
 [![threshold](https://img.shields.io/badge/default%20threshold-95%25-D97706?style=flat-square)](#configuration)
@@ -10,9 +10,10 @@
 [![license](https://img.shields.io/badge/license-CC%20BY--NC--SA%204.0-8E44AD?style=flat-square)](#license)
 [![author](https://img.shields.io/badge/author-Manuel%20Alvarado-1F2937?style=flat-square)](#license)
 
-Guards the account's **5-hour Claude session window**. Watches the percentage,
-pauses every tool before the limit lands, holds the interrupted turn open across
-the rollover, and picks the work back up by itself when the window resets.
+Guards the account's **5-hour Claude session window**. Watches the percentage and
+holds every tool call before the limit lands, until the window rolls over and the
+call can run — so the work waits instead of dying, and picks itself back up with
+no resume protocol at all.
 
 The problem it solves: hitting the window limit in the middle of a long task
 loses whatever was in flight. Keeper stops the work on purpose, with the budget
@@ -70,21 +71,44 @@ Refresh cadence adapts, because a stale reading only matters near the wall:
 | 70–89% | 3 min |
 | 90%+ | 90 s |
 
-### The pause and the timer
+### The pause is a wait, not a refusal
 
-At or above the threshold, `PreToolUse` returns a `deny` decision for **every**
-tool, fires a desktop notification, and arms a detached timer that sleeps until
-the reset moment and announces the rollover. Nobody has to watch the clock.
+At or above the threshold, `PreToolUse` **holds** the call: the hook sleeps,
+waking every 15s to re-read the state, and returns only once the window has
+rolled over — at which point the tool call it was asked about simply runs. A
+desktop notification fires when the pause starts and when it lifts.
+
+It used to deny instead, and denying is what made the pause lossy. A denial ends
+the agent that receives it. The main session survived that, because the `Stop`
+hook holds its turn open and restarts it, but a subagent did not: nothing
+re-invokes one, and the restart is granted once per pause for the whole account,
+so a fan-out of ten lost nine. Holding answers all of them at once, and needs no
+resume protocol — the held call *is* the continuation.
+
+The wait costs a sleeping shell and no tokens, and it is capped at 18300s, just
+under the `timeout` the `PreToolUse` hook is wired with. That order is
+load-bearing: a hook the harness cancels contributes no decision at all and the
+tool then runs, so Keeper always answers first. When the cap runs out before the
+window turns over, it falls back to the denial — and to the timer and the `Stop`
+hook resume that have always covered that case. `KEEPER_WAIT_CAP=0` restores the
+old deny-on-the-spot behaviour outright.
+
+While a call is held the session looks frozen: the model gets no denial, so it
+says nothing. The badge is the only signal, which is why it keeps saying
+`BLOCKED` even past the reset time.
 
 Once the reset time passes, the next hook call clears the pause, records `0`
 (the window genuinely restarts empty, and keeping the stale high reading would
 re-block the very next tool call) and zeroes the reading's timestamp so a fresh
 probe runs immediately rather than trusting that `0`.
 
-A pause also lifts on a *bogus* reset time, not only a past one. Requiring a
-valid timestamp to release made a zero or corrupt value an unbreakable pause:
-every tool denied indefinitely, including the command that would lift it, so the
-only way out was an external terminal.
+A pause also lifts on a *bogus* reset time, not only a past one, and it lifts
+without waiting: a percentage over the threshold sitting next to a reset time
+nobody can read is corrupt state, not a pause with an end, and holding on it
+would wait for a moment that never arrives. Requiring a valid timestamp to
+release made a zero or corrupt value an unbreakable pause: every tool denied
+indefinitely, including the command that would lift it, so the only way out was
+an external terminal.
 
 The clock is not the only way out either, because the reset time is a prediction
 and the percentage is a reading. A window that rolls over earlier than predicted
@@ -260,7 +284,8 @@ will not restart the turn on a number it had to guess.
 | `PreToolUse` below threshold | **0** — no output, so nothing enters context |
 | Statusline badge | **0** — the statusline is never part of context |
 | `SessionStart` block | ~69 (254 characters, 47 words, asserted under 120 words by the self-check) |
-| Trip event, per denied call | ~85 |
+| A held call | **0** — a sleeping shell, no model involved and no denial in context |
+| Trip event, per denied call at the cap | ~85 |
 | Holding a paused turn open | **0** — a sleeping shell, no model involved |
 | The resume instruction | ~90 — the `reason` the hook injects to restart the turn |
 | The resumed turn itself | one ordinary turn, in the *new* window it just waited for |
@@ -275,12 +300,13 @@ bash ~/.claude/skills/keeper/hooks/keeper.sh off           # stop guarding
 bash ~/.claude/skills/keeper/hooks/keeper.sh on            # resume guarding
 ```
 
-Raising the threshold above the current percentage lifts an active pause on the
-spot — the escape hatch for deciding the remaining budget is yours to spend.
+Raising the threshold above the current percentage lifts an active pause within
+15s — the escape hatch for deciding the remaining budget is yours to spend.
 
 Run that command from a normal terminal, not from inside the paused session:
-while the pause is active every tool call is denied by design, which includes the
-one that would lift it.
+while the pause is active every tool call is held by design, which includes the
+one that would lift it. From outside, `off` and `threshold` both reach a held
+call on its next wake.
 
 Files:
 
@@ -288,7 +314,7 @@ Files:
 |---|---|
 | `~/.claude/skills/keeper/hooks/keeper.sh` | probe, gate, session block, the held-open turn, config |
 | `~/.claude/skills/keeper/hooks/keeper-statusline.sh` | `[KEEPER:NN%]` badge |
-| `~/.claude/skills/keeper/hooks/keeper-selfcheck.sh` | 165 offline assertions |
+| `~/.claude/skills/keeper/hooks/keeper-selfcheck.sh` | 204 offline assertions |
 | `~/.claude/skills/keeper/SKILL.md` | the control-surface skill |
 | `~/.claude/.keeper-state` | cached reading (`pct`, `reset_epoch`, `blocked`) |
 | `~/.claude/.keeper-config` | `threshold=95`, `enabled=1` |
@@ -306,10 +332,27 @@ line exists because a misconfigured guard is indistinguishable from a quiet one.
 
 Wiring lives in `~/.claude/settings.json`: a `SessionStart` hook, a `PreToolUse`
 hook matching all tools, a `Stop` hook, and a segment appended to `statusLine`.
-The `Stop` hook is the one with a non-default timeout — it has to outlast
-Keeper's own 18300s cap on the wait:
+
+**Both the `PreToolUse` and the `Stop` hook need a non-default timeout.** Each
+has to outlast Keeper's own 18300s cap on its wait, and the `PreToolUse` one is
+not optional: a hook the harness cancels contributes no decision, so a gate wired
+at the default timeout is cancelled mid-hold and the tool then runs unguarded at
+96% — a guard that reports itself as enabled and paused while guarding nothing.
+`status` warns about this when it can see the wiring.
 
 ```json
+"PreToolUse": [
+  {
+    "matcher": "*",
+    "hooks": [
+      {
+        "type": "command",
+        "command": "bash \"$HOME/.claude/skills/keeper/hooks/keeper.sh\" check",
+        "timeout": 18420
+      }
+    ]
+  }
+],
 "Stop": [
   {
     "hooks": [
@@ -329,12 +372,15 @@ Keeper's own 18300s cap on the wait:
 bash ~/.claude/skills/keeper/hooks/keeper-selfcheck.sh
 ```
 
-108 assertions, fully offline against a fixture in a throwaway `KEEPER_HOME`, so
+204 assertions, fully offline against a fixture in a throwaway `KEEPER_HOME`, so
 it needs no network and never touches real state. Covers percentage parsing,
 timezone-aware reset math, the dateless `resets 3:50pm` variant, inclusive
-threshold, auto-release, the held-open turn and its loop guard, percentage
-zeroing, config validation, refresh cadence, badge colors, the countdown, and
-every item under Hardening below.
+threshold, auto-release, the held call and every way out of it, the cap and its
+fallback to the denial, parallel holds, the held-open turn and its loop guard,
+percentage zeroing, config validation, refresh cadence, badge colors, the
+countdown, and every item under Hardening below.
+
+The hold cases sleep for real, so the suite takes about four minutes.
 
 Reset clauses in the fixtures are generated relative to now. They were once
 hardcoded to a specific date and hour, which meant the suite proved nothing the
@@ -397,20 +443,35 @@ boundary is what the measures below have in common.
 
 Stated plainly, because a guard that oversells itself is worse than none:
 
-1. **It gates tools, not text.** The denial instructs the stop; it cannot
-   physically prevent a reply from being written.
-2. **A subagent mid-call finishes that call.** The block lands on its next one.
+1. **It gates tools, not text.** A held call stops the work by not returning;
+   the denial at the cap instructs the stop but cannot physically prevent a reply
+   from being written.
+2. **A subagent mid-call finishes that call.** The hold lands on its next one.
    With subagent-heavy sessions there can be a few seconds of overshoot — which
    is why the default leaves 5% of headroom instead of sitting at 99%.
 3. **The window is per account**, spanning other machines and claude.ai. The
    percentage itself comes from the server and is accurate; only the usage
    attribution breakdown in `/usage` is local to this machine.
-4. **Ambiguity resolves toward allowing.** If the reading is unknown or the state
+4. **There is no recovery from inside a paused session.** Every tool call routes
+   through the same gate, including the Bash call that would run `keeper.sh off`
+   or `threshold 99`, and including the `/keeper` skill. Those commands work from
+   a separate terminal and take effect within 15s. This is not new — at 95% the
+   old gate denied them too — but the silence is: nothing is written into the
+   session to explain the wait, so the badge is the whole story.
+5. **The hold depends on the wiring.** Without a `timeout` above the cap on the
+   `PreToolUse` hook, the harness cancels the hook mid-wait, contributes no
+   decision, and the tool runs unguarded at 96%. `status` and the session block
+   say so when they can see a wiring that cannot hold — user settings, project
+   settings and their `.local` variants — but a wiring passed in by another route
+   is invisible from inside the hook.
+6. **Ambiguity resolves toward allowing.** If the reading is unknown or the state
    file is corrupt, Keeper lets the tool through and says so loudly in `status`,
    the badge, and the session block rather than blocking. Failing open wastes the
    budget this exists to protect; failing closed strands the user, since the
    command that lifts a pause is itself denied. The visible-failure signals are
-   there because that choice only works if you can see it was made.
+   there because that choice only works if you can see it was made. With a
+   fan-out of held calls the blast radius is wider than it was: a state file that
+   disappears mid-wait frees every parked call at once, within 15s.
 
 ## Requirements
 

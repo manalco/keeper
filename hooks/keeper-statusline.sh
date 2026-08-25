@@ -85,8 +85,16 @@ if [ "$blocked" = "1" ] && [ -n "$reset_epoch" ] && [ "$reset_epoch" -gt "$now" 
   badge "$RED" ":${pct}% BLOCKED $countdown"
   exit 0
 fi
-# Past its reset, a blocked flag is stale: only a tool call can clear it, so an
-# idle session would otherwise sit on a red 0m countdown indefinitely.
+# Blocked with the reset behind us. This used to fall through to the ordinary
+# badge, on the reasoning that only a tool call clears the flag and an idle
+# session would otherwise sit on a red 0m countdown forever. A held call clears
+# it now, and while it waits out the grace the badge is the only thing telling
+# anyone why the session is frozen — so it says so, without a countdown it
+# cannot honestly give.
+if [ "$blocked" = "1" ]; then
+  badge "$RED" ":${pct}% BLOCKED"
+  exit 0
+fi
 
 # The colors track the configured threshold rather than fixed cuts, or they stop
 # meaning "near the wall" the moment the threshold moves.

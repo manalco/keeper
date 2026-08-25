@@ -36,7 +36,16 @@ cleanup() {
       pid="${pid//[!0-9]/}"
       [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && kill "$pid" 2>/dev/null
     fi
-    case "$h" in /*keeper-selfcheck.*) rm -rf "$h" ;; esac
+    # The recorded pid is not always the only one: a case that replaces a timer
+    # record, or one whose sleeper outlived its file, leaves a two-hour process
+    # behind. Enough runs of that filled the process table and every fork in the
+    # shell started failing.
+    case "$h" in
+      /*keeper-selfcheck.*)
+        for stray in $(pgrep -f "keeper-timer.*$h" 2>/dev/null); do kill "$stray" 2>/dev/null; done
+        rm -rf "$h"
+        ;;
+    esac
   done
 }
 trap cleanup EXIT
@@ -323,10 +332,15 @@ assert_contains "blocked badge renders red" $'\033[38;5;160m' "$badge"
 if printf '%s' "$badge" | grep -qE '[0-9]+h[0-9]+m|[0-9]+m'; then ok "blocked badge counts down"
 else bad "blocked badge counts down" "an h/m countdown" "$badge"; fi
 
-# An idle session past its reset would otherwise show a red 0m countdown forever,
-# since only a tool call can clear the flag.
+# Past the reset the badge keeps saying BLOCKED and drops the countdown. It used
+# to clear the whole badge, because only a tool call could clear the flag and an
+# idle session would have sat on a red 0m countdown forever. A held call clears
+# it now, and while one waits out the grace the badge is the only thing that says
+# why the session is frozen — the model is not talking, and no denial was issued.
 set_field reset_epoch "$(( $(date +%s) - 60 ))"
-assert_not_contains "stale block clears itself in the badge" "BLOCKED" "$(bash "$STATUSLINE" 2>/dev/null)"
+badge=$(bash "$STATUSLINE" 2>/dev/null)
+assert_contains "a stale block still says BLOCKED" "BLOCKED" "$badge"
+assert_contains "a stale block offers no countdown" "BLOCKED]" "$badge"
 
 # Colors that ignore the configured threshold stop meaning "near the wall".
 new_home
@@ -1185,6 +1199,99 @@ probe_with 96 "$(clause_in 2)"
 set_field reset_epoch "$(( $(date +%s) + 2 ))"
 out=$(KEEPER_WAIT_CAP="not a number" bash "$KEEPER" check 2>/dev/null)
 assert_eq "a malformed cap falls back to holding" "" "$out"
+
+# A percentage over the threshold sitting next to a reset time nobody can read
+# is a corrupt state, not a pause with an end. Holding on it would wait for a
+# moment that never comes, so the call goes through — the same rule the rest of
+# the guard follows for state it cannot trust. What it must not do is announce a
+# rollover that never happened.
+new_home
+probe_with 96 "$(clause_in 2)"
+set_field reset_epoch 0
+t0=$(date +%s)
+out=$(KEEPER_WAIT_CAP=60 bash "$KEEPER" check 2>/dev/null)
+t1=$(date +%s)
+assert_eq "an unreadable reset lets the tripping call through" "" "$out"
+if [ $(( t1 - t0 )) -lt 3 ]; then ok "an unreadable reset is not waited on"
+else bad "an unreadable reset is not waited on" "<3s" "$(( t1 - t0 ))s"; fi
+assert_eq "an unreadable reset leaves no pause behind" "0" "$(state blocked)"
+
+# An estimated reset has no countdown to offer, but it still bounds the wait, and
+# the denial at the cap has to say that rather than invent a duration.
+new_home
+probe_with 96 "resets never"
+assert_eq "an unreadable clause is marked estimated" "1" "$(state reset_est)"
+out=$(KEEPER_WAIT_CAP=2 bash "$KEEPER" check 2>/dev/null)
+assert_contains "a capped hold on an estimate offers no countdown" "no countdown" "$out"
+
+# The state file going away mid-hold is the ambiguous case the whole file
+# resolves the same way: let the work through rather than hold it on nothing.
+new_home
+probe_with 96 "$(clause_in 2)"
+( sleep 2; rm -f "$KEEPER_HOME/.keeper-state" ) &
+t0=$(date +%s)
+out=$(KEEPER_WAIT_CAP=60 bash "$KEEPER" check 2>/dev/null)
+t1=$(date +%s)
+wait
+assert_eq "losing the state mid-hold frees the call" "" "$out"
+if [ $(( t1 - t0 )) -lt 30 ]; then ok "the lost state ends the wait"
+else bad "the lost state ends the wait" "<30s" "$(( t1 - t0 ))s"; fi
+
+# The timer announces a rollover to a session that stopped. A held call has not
+# stopped, and arming one per pass per waiter piled up detached five-hour
+# sleepers that `keeper.sh off` could not kill, since only the last was recorded.
+new_home
+probe_with 96 "$(clause_in 2)"
+set_field reset_epoch "$(( $(date +%s) + 3 ))"
+KEEPER_WAIT_CAP=40 bash "$KEEPER" check >/dev/null 2>&1 &
+p1=$!
+KEEPER_WAIT_CAP=40 bash "$KEEPER" check >/dev/null 2>&1 &
+p2=$!
+sleep 2
+assert_eq "a held call arms no timer" "0" \
+  "$([ -f "$KEEPER_HOME/.keeper-timer.pid" ] && echo 1 || echo 0)"
+wait $p1 $p2
+# The denial at the cap is the one path that does leave the session stopped, so
+# that is where the announcement belongs.
+new_home
+probe_with 96 "$(clause_in 2)"
+KEEPER_WAIT_CAP=1 bash "$KEEPER" check >/dev/null 2>&1
+assert_eq "a capped hold arms the timer" "1" \
+  "$([ -f "$KEEPER_HOME/.keeper-timer.pid" ] && echo 1 || echo 0)"
+
+# Arming is check-then-act, and callers arrive together: a fan-out all denying at
+# the cap, or several sessions meeting one rollover. Each spawned its own
+# five-hour sleeper and only the last was recorded, so the rest could never be
+# killed — not by `disarm_timer`, not by `keeper.sh off`.
+new_home
+probe_with 96 "$(clause_in 2)"
+for _ in 1 2 3 4; do KEEPER_WAIT_CAP=0 bash "$KEEPER" check >/dev/null 2>&1 & done
+wait
+assert_eq "arming at once leaves exactly one timer" "1" \
+  "$(ps -eo command 2>/dev/null | grep -c "[k]eeper-timer.*$KEEPER_HOME")"
+
+# Clearing a reading rewrites the file once. The fields it does not touch have to
+# survive that, or a release quietly loses the reset time it just released on.
+new_home
+probe_with 96 "$(clause_in 2)"
+bash "$KEEPER" check >/dev/null 2>&1
+label_before=$(state reset_human)
+set_field reset_epoch "$(( $(date +%s) - 600 ))"
+KEEPER_WAIT_CAP=0 bash "$KEEPER" check >/dev/null 2>&1
+assert_eq "a release keeps the fields it does not clear" "$label_before" "$(state reset_human)"
+assert_eq "a release clears the reading in one pass" "0-0-0" \
+  "$(state blocked)-$(state pct)-$(state fetched_at)"
+
+# People wire the hook from project settings as often as from user settings, and
+# a warning that reads only one of them is silent for everyone who used another.
+new_home
+probe_with 40 "$(clause_in 2)"
+mkdir -p "$KEEPER_HOME/proj/.claude"
+cat > "$KEEPER_HOME/proj/.claude/settings.json" <<'JSON'
+{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"bash \"$HOME/.claude/skills/keeper/hooks/keeper.sh\" check"}]}]}}
+JSON
+assert_contains "project settings are checked for the timeout too" "timeout" \
+  "$(KEEPER_WAIT_CAP=18300 CLAUDE_PROJECT_DIR="$KEEPER_HOME/proj" KEEPER_SETTINGS=/nonexistent bash "$KEEPER" status 2>/dev/null)"
 
 # The cap only works if the harness lets the hook run that long. A missing
 # timeout in the wiring cancels the hook mid-hold, and a cancelled PreToolUse

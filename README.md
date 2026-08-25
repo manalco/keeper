@@ -1,7 +1,7 @@
 # Keeper
 
 [![status](https://img.shields.io/badge/status-active-108C4A?style=flat-square)](#)
-[![self--check](https://img.shields.io/badge/self--check-203%2F203%20passing-2E7D32?style=flat-square)](#self-check)
+[![self--check](https://img.shields.io/badge/self--check-204%2F204%20passing-2E7D32?style=flat-square)](#self-check)
 [![token cost](https://img.shields.io/badge/token%20cost-~69%20tokens%2Fsession-1565C0?style=flat-square)](#what-it-costs)
 [![probe](https://img.shields.io/badge/probe-0%20API%20calls-1565C0?style=flat-square)](#how-it-works)
 [![threshold](https://img.shields.io/badge/default%20threshold-95%25-D97706?style=flat-square)](#configuration)
@@ -314,7 +314,7 @@ Files:
 |---|---|
 | `~/.claude/skills/keeper/hooks/keeper.sh` | probe, gate, session block, the held-open turn, config |
 | `~/.claude/skills/keeper/hooks/keeper-statusline.sh` | `[KEEPER:NN%]` badge |
-| `~/.claude/skills/keeper/hooks/keeper-selfcheck.sh` | 203 offline assertions |
+| `~/.claude/skills/keeper/hooks/keeper-selfcheck.sh` | 204 offline assertions |
 | `~/.claude/skills/keeper/SKILL.md` | the control-surface skill |
 | `~/.claude/.keeper-state` | cached reading (`pct`, `reset_epoch`, `blocked`) |
 | `~/.claude/.keeper-config` | `threshold=95`, `enabled=1` |
@@ -372,7 +372,7 @@ at the default timeout is cancelled mid-hold and the tool then runs unguarded at
 bash ~/.claude/skills/keeper/hooks/keeper-selfcheck.sh
 ```
 
-203 assertions, fully offline against a fixture in a throwaway `KEEPER_HOME`, so
+204 assertions, fully offline against a fixture in a throwaway `KEEPER_HOME`, so
 it needs no network and never touches real state. Covers percentage parsing,
 timezone-aware reset math, the dateless `resets 3:50pm` variant, inclusive
 threshold, auto-release, the held call and every way out of it, the cap and its

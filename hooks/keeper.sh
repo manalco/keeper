@@ -993,10 +993,14 @@ do_check() {
 # is unreadable from here, and crying wolf at a correct setup is how a real
 # warning gets ignored.
 settings_paths() {
-  local d="${CLAUDE_PROJECT_DIR:-}"
   printf '%s\n' "${KEEPER_SETTINGS:-$KEEPER_HOME/settings.json}" \
-    "$KEEPER_HOME/settings.local.json" \
-    ${d:+"$d/.claude/settings.json" "$d/.claude/settings.local.json"}
+    "$KEEPER_HOME/settings.local.json"
+  # Spelled out rather than folded into the printf above with `${d:+...}`: that
+  # form drops its quoting and splits a project directory with a space in it into
+  # two unreadable paths, which is silence exactly where a warning was the point.
+  local d="${CLAUDE_PROJECT_DIR:-}"
+  [ -n "$d" ] && printf '%s\n' "$d/.claude/settings.json" "$d/.claude/settings.local.json"
+  return 0
 }
 hold_wiring() {
   [ "$WAIT_CAP" -eq 0 ] && return 0

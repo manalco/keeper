@@ -1293,6 +1293,13 @@ JSON
 assert_contains "project settings are checked for the timeout too" "timeout" \
   "$(KEEPER_WAIT_CAP=18300 CLAUDE_PROJECT_DIR="$KEEPER_HOME/proj" KEEPER_SETTINGS=/nonexistent bash "$KEEPER" status 2>/dev/null)"
 
+# Project directories have spaces in them all the time, and a path that splits
+# into two unreadable ones warns about nothing at all.
+mkdir -p "$KEEPER_HOME/my proj/.claude"
+cp "$KEEPER_HOME/proj/.claude/settings.json" "$KEEPER_HOME/my proj/.claude/settings.json"
+assert_contains "a project path with a space is still checked" "timeout" \
+  "$(KEEPER_WAIT_CAP=18300 CLAUDE_PROJECT_DIR="$KEEPER_HOME/my proj" KEEPER_SETTINGS=/nonexistent bash "$KEEPER" status 2>/dev/null)"
+
 # The cap only works if the harness lets the hook run that long. A missing
 # timeout in the wiring cancels the hook mid-hold, and a cancelled PreToolUse
 # hook contributes no decision — the tool runs, unguarded, at 96%.
